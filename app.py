@@ -2706,202 +2706,100 @@ def _turbo_build_base_preset(df_valid: pd.DataFrame) -> dict:
         lab_max_profit=max_profit,
     )
 
-def _turbo_eval_preset(df_valid: pd.DataFrame, preset: dict) -> dict:
-    """Evalúa un preset (con filtros + simulación) y devuelve métricas.
-    IMPORTANTE: presets que dejan 0 trades o muy pocos trades se marcan como inválidos para que no “ganen” por DD=0.
-    """
-    # Thresholds (pueden venir desde el UI y viajan dentro del preset)
-    min_trades = int(preset.get("_min_trades", 50))
-    min_days   = int(preset.get("_min_days", 5))
-    allow_non_positive = bool(preset.get("_allow_non_positive", False))
-
-    # Column inference (tolerante)
-    pnl_col = _infer_col(df_valid, ["tradeRealized","trade_realized","realized","pnl","PnL","pnl_usd","pnl$"])
-    time_col = _infer_col(df_valid, ["exit_ts","exit_time","ts","time","exitTime","exit"])
-    if pnl_col is None:
-        return dict(valid=False, reason="No se encontró columna de PnL/realized.",
-                    pnl=-1e18, dd=1e18, ratio=-1e18, n=0, corr=float("nan"),
-                    days=0, win_rate=float("nan"), avg_pnl=float("nan"))
-
-    # 1) Filtrar por parámetros del preset (usa lógica del Lab, NO reinventamos)
-    try:
-        sim_filtered = _lab_filter_df_params(df_valid, preset)
-    except Exception as e:
-        return dict(valid=False, reason=f"Error filtrando: {e}",
-                    pnl=-1e18, dd=1e18, ratio=-1e18, n=0, corr=float("nan"),
-                    days=0, win_rate=float("nan"), avg_pnl=float("nan"))
-
+def _turbo_eval_preset(df_valid, preset):
+    sim_filtered = _lab_filter_df_params(df_valid, preset)
     if sim_filtered is None or sim_filtered.empty:
-        return dict(valid=False, reason="0 trades tras filtros.",
-                    pnl=-1e18, dd=1e18, ratio=-1e18, n=0, corr=float("nan"),
-                    days=0, win_rate=float("nan"), avg_pnl=float("nan"))
+        return {"pnl_total": 0.0, "dd_abs": 0.0, "ratio_pnl_dd": 0.0, "n_trades": 0}
 
-    # 2) Simulación de reglas diarias (misma que el resto del app)
+    # Map preset knobs to the actual simulator signature (which returns (sim_kept, stops_df))
+    rr_stop_win = float(preset.get("rr_stop_win", preset.get("lab_rr_stop_win", 2.0)))
+    max_loss    = float(preset.get("lab_max_loss", preset.get("max_loss", 0.0)))
+    max_profit  = float(preset.get("lab_max_profit", preset.get("max_profit", 0.0)))
+
+    max_trades = int(preset.get("lab_max_trades", preset.get("max_trades_per_day", 0)) or 0)
+    if max_trades <= 0:
+        max_trades = 999999
+
+    max_consec_losses = int(preset.get("lab_max_consec_losses", preset.get("max_consec_losses", 0)) or 0)
+    if max_consec_losses <= 0:
+        max_consec_losses = 999999
+
+    stop_big_loss = bool(preset.get("lab_stop_big_loss", preset.get("stop_big_loss", False)))
+    stop_big_win  = bool(preset.get("lab_stop_big_win", preset.get("stop_big_win", False)))
+
     try:
-        sim_kept = _simulate_daily_rules(
+        res = _simulate_daily_rules(
             sim_filtered,
-            max_losses_per_day=preset.get("max_losses_per_day", 99),
-            max_wins_per_day=preset.get("max_wins_per_day", 99),
-            max_trades_per_day=preset.get("max_trades_per_day", 999),
-            allow_reentry=preset.get("allow_reentry", True),
-            rr_stop_win=float(preset.get("rr_stop_win", 2.0)),
+            rr_stop_win=rr_stop_win,
+            max_loss=max_loss,
+            max_profit=max_profit,
+            max_trades_per_day=max_trades,
+            max_consec_losses=max_consec_losses,
+            stop_big_loss=stop_big_loss,
+            stop_big_win=stop_big_win,
         )
     except TypeError:
-        # compatibilidad si la firma cambió en versiones viejas
-        sim_kept = _simulate_daily_rules(sim_filtered)
-    except Exception as e:
-        return dict(valid=False, reason=f"Error simulando reglas: {e}",
-                    pnl=-1e18, dd=1e18, ratio=-1e18, n=0, corr=float("nan"),
-                    days=0, win_rate=float("nan"), avg_pnl=float("nan"))
+        # Extremely defensive fallback for older signatures
+        res = _simulate_daily_rules(sim_filtered)
 
-    if sim_kept is None or sim_kept.empty:
-        return dict(valid=False, reason="0 trades tras reglas diarias.",
-                    pnl=-1e18, dd=1e18, ratio=-1e18, n=0, corr=float("nan"),
-                    days=0, win_rate=float("nan"), avg_pnl=float("nan"))
+    sim_kept = res[0] if isinstance(res, (tuple, list)) and len(res) > 0 else res
 
-    # Metrics
-    pnl_s = pd.to_numeric(sim_kept[pnl_col], errors="coerce").fillna(0.0)
-    pnl = float(pnl_s.sum())
-    n = int(len(pnl_s))
+    if sim_kept is None or not hasattr(sim_kept, "empty") or sim_kept.empty:
+        return {"pnl_total": 0.0, "dd_abs": 0.0, "ratio_pnl_dd": 0.0, "n_trades": 0}
 
-    # Days count
-    days = 0
-    if time_col is not None and time_col in sim_kept.columns:
-        ts = pd.to_datetime(sim_kept[time_col], errors="coerce")
-        days = int(ts.dt.date.nunique())
-
-    # Win rate / avg pnl
-    win_rate = float((pnl_s > 0).mean()) if n > 0 else float("nan")
-    avg_pnl = float(pnl_s.mean()) if n > 0 else float("nan")
-
-    # Drawdown over equity curve (cumulative pnl)
-    dd = 0.0
+    # Robust PnL column inference (different logs use different names)
+    pnl_col = None
     try:
-        equity = pnl_s.cumsum()
-        peak = equity.cummax()
-        dd = float((peak - equity).max())
-        if not np.isfinite(dd):
-            dd = 0.0
+        pnl_col = _infer_col(sim_kept, ["tradeRealized", "trade_realized", "realized", "realizedPnl", "pnl", "PnL", "netPnl", "profit", "net_profit", "pnl_usd", "pnl$"])
     except Exception:
-        dd = 0.0
+        pnl_col = None
 
-    # Ratio (pnl per drawdown) – evita divisiones raras
-    ratio = pnl / max(dd, 1.0)
+    if pnl_col is None:
+        for c in sim_kept.columns:
+            if isinstance(c, str):
+                lc = c.lower()
+                if ("pnl" in lc) or ("realiz" in lc) or ("profit" in lc):
+                    pnl_col = c
+                    break
 
-    # Correlation PnL vs DD no aplica por preset (1 punto), dejamos NaN
-    corr = float("nan")
+    if pnl_col is None:
+        return {"pnl_total": 0.0, "dd_abs": 0.0, "ratio_pnl_dd": 0.0, "n_trades": int(len(sim_kept))}
 
-    # Validity gates: evita “ganadores” con n=1 o 0
-    if (n < min_trades) or (days < min_days):
-        return dict(valid=False, reason=f"Demasiado poco sample: n={n}, días={days}.",
-                    pnl=pnl, dd=dd, ratio=ratio, n=n, corr=corr,
-                    days=days, win_rate=win_rate, avg_pnl=avg_pnl)
+    pnl_s = pd.to_numeric(sim_kept[pnl_col], errors="coerce").fillna(0.0)
+    pnl_total = float(pnl_s.sum())
 
-    if (not allow_non_positive) and (pnl <= 0):
-        return dict(valid=False, reason="PnL <= 0 (oculto por default).",
-                    pnl=pnl, dd=dd, ratio=ratio, n=n, corr=corr,
-                    days=days, win_rate=win_rate, avg_pnl=avg_pnl)
+    equity = pnl_s.cumsum()
+    peak = equity.cummax()
+    dd_abs = float((peak - equity).max()) if len(equity) else 0.0
 
-    return dict(valid=True, reason="OK",
-                pnl=pnl, dd=dd, ratio=ratio, n=n, corr=corr,
-                days=days, win_rate=win_rate, avg_pnl=avg_pnl)
+    ratio = float(pnl_total / (dd_abs + 1e-9)) if dd_abs > 0 else (float(pnl_total) if pnl_total != 0 else 0.0)
 
-def _turbo_rank_key(met: dict, objective: str) -> tuple:
-    # Objective: "pnl" | "dd" | "balance"
-    if not met or not met.get("valid", True):
-        return (-1e18, -1e18, -1e18, -1e18)
+    return {
+        "pnl_total": pnl_total,
+        "dd_abs": dd_abs,
+        "ratio_pnl_dd": ratio,
+        "n_trades": int(len(sim_kept)),
+    }
 
-    pnl = float(met.get("pnl", 0.0))
-    dd  = float(met.get("dd", 0.0))
-    ratio = float(met.get("ratio", 0.0))
-    n   = float(met.get("n", 0.0))
 
-    # Penaliza levemente muestras pequeñas aunque pasen el gate
-    sample_bonus = np.log10(max(n, 1.0)) / 10.0
+def _turbo_rank_key(r, objective):
+    m = r["met"]
+    pnl = float(m.get("pnl_total", 0.0))
+    dd  = float(m.get("dd_abs", 0.0))
+    ratio = float(m.get("ratio_pnl_dd", 0.0))
+    n = int(m.get("n_trades", 0))
 
-    if objective == "dd":
-        # Menor DD es mejor, pero sin sacrificar demasiado PnL
-        return (-dd, pnl, ratio, sample_bonus)
-    if objective == "balance":
-        # Ratio manda, luego pnl, luego dd
-        return (ratio, pnl, -dd, sample_bonus)
-    # default: pnl
-    return (pnl, -dd, ratio, sample_bonus)
+    # Prefer presets with a reasonable sample size (avoid “one lucky trade” presets)
+    sample = min(1.0, n / 50.0)
+    stability = 0.25 + 0.75 * sample
 
-def _turbo_candidate_space(df_valid: pd.DataFrame, base: dict, mode: str):
-    hour_labels = _hour_labels_list(df_valid)
-    dirs_all = ["Compra", "Venta", "No definida"]
+    if objective == "DD":
+        return (-dd, pnl * stability, ratio * stability, n)
+    if objective == "PNL":
+        return (pnl * stability, -dd, ratio, n)
+    # BAL
+    return (ratio * stability, pnl * stability, -dd, n)
 
-    top_hours = _top_hours(df_valid, top_k=3, min_n=5)
-    best_hour = top_hours[0] if top_hours else None
-    best_dir = _best_direction(df_valid, min_n=8)
-
-    or_bins = _top_bins(df_valid, ["or_size","OR","or","openingRange","orSize"], top_k=3, q=6, min_n=10)
-    atr_bins = _top_bins(df_valid, ["atr","ATR","atr_val","atrValue"], top_k=3, q=6, min_n=10)
-    or_best = or_bins[0] if or_bins else None
-    atr_best = atr_bins[0] if atr_bins else None
-
-    mt_sug = int(st.session_state.get("_sug_max_trades", 3) or 3)
-    ml_sug = int(st.session_state.get("_sug_max_consec_losses", 3) or 3)
-
-    if mode == "A":
-        hours_opts = [hour_labels, [best_hour] if best_hour else hour_labels]
-        dirs_opts = [dirs_all, [best_dir] if best_dir else dirs_all]
-        or_opts = [base["lab_or_rng"], or_best if or_best else base["lab_or_rng"]]
-        atr_opts = [base["lab_atr_rng"], atr_best if atr_best else base["lab_atr_rng"]]
-        mt_opts = [0, mt_sug]
-        ml_opts = [0, ml_sug]
-        stop_loss_opts = [False]
-        stop_win_opts = [False]
-    else:
-        hours_opts = [hour_labels] + ([[best_hour]] if best_hour else [])
-        for h in top_hours:
-            if [h] not in hours_opts:
-                hours_opts.append([h])
-        if len(top_hours) >= 2:
-            hours_opts.append(top_hours[:2])
-
-        dirs_opts = [dirs_all, ["Compra"], ["Venta"]]
-        or_opts = [base["lab_or_rng"]] + or_bins
-        atr_opts = [base["lab_atr_rng"]] + atr_bins
-        mt_opts = [0, 1, 2, 3, 4]
-        ml_opts = [0, 1, 2, 3]
-        stop_loss_opts = [False, True]
-        stop_win_opts = [False, True]
-
-    seen = set()
-    for hrs in hours_opts:
-        for dirs in dirs_opts:
-            for or_rng in or_opts:
-                for atr_rng in atr_opts:
-                    for mt in mt_opts:
-                        for ml in ml_opts:
-                            for sbl in stop_loss_opts:
-                                for sbw in stop_win_opts:
-                                    p = dict(base)
-                                    p["lab_hours_allowed"] = hrs
-                                    p["lab_dirs_allowed"] = dirs
-                                    p["lab_or_rng"] = or_rng
-                                    p["lab_atr_rng"] = atr_rng
-                                    p["lab_max_trades"] = int(mt)
-                                    p["lab_max_consec_losses"] = int(ml)
-                                    p["lab_stop_big_loss"] = bool(sbl)
-                                    p["lab_stop_big_win"] = bool(sbw)
-
-                                    key = (
-                                        tuple(p["lab_hours_allowed"]),
-                                        tuple(p["lab_dirs_allowed"]),
-                                        tuple(map(float, p["lab_or_rng"])),
-                                        tuple(map(float, p["lab_atr_rng"])),
-                                        p["lab_max_trades"],
-                                        p["lab_max_consec_losses"],
-                                        p["lab_stop_big_loss"],
-                                        p["lab_stop_big_win"],
-                                    )
-                                    if key in seen:
-                                        continue
-                                    seen.add(key)
-                                    yield p
 
 def _turbo_apply_preset_idx(idx: int):
     results = st.session_state.get("_turbo_results", [])
