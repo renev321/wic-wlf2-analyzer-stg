@@ -1907,27 +1907,13 @@ def _finite_minmax(s: pd.Series):
 
 
 
-def _hour_labels_list(df: pd.DataFrame) -> list:
-    """Return sorted hour-bucket labels present in the dataframe (based on entry timestamp if available)."""
-    if df is None or len(df) == 0:
+def _hour_labels_list(df: pd.DataFrame):
+    ts_col = _infer_col(df, ["entry_ts", "entryTime", "entry_time", "ts_entry"])
+    if not ts_col:
         return []
-    ts_col = _infer_col(df, ["entry_ts","entry_time","ts","time","datetime","date","exit_ts","exit_time"])
-    if ts_col is None or ts_col not in df.columns:
-        return []
-    s = pd.to_datetime(df[ts_col], errors="coerce")
-    if s.isna().all():
-        return []
-    hrs = s.dt.hour.dropna().astype(int)
-    if hrs.empty:
-        return []
-    keep = sorted(set(int(h) for h in hrs.unique() if pd.notna(h)))
-    labels = []
-    for h in keep:
-        try:
-            labels.append(_hour_label(pd.Timestamp("2000-01-01") + pd.Timedelta(hours=int(h))))
-        except Exception:
-            continue
-    return labels
+    ts = pd.to_datetime(df[ts_col], errors="coerce")
+    hours = sorted([int(h) for h in ts.dt.hour.dropna().unique()])
+    return [_hour_label(h) for h in hours]
 
 def _lab_quick_suggestions(t: pd.DataFrame, min_bucket: int = 5) -> dict:
     """Heurísticas rápidas basadas en tu historial REAL (no simulado).
@@ -2196,6 +2182,101 @@ def _apply_filters(df_in: pd.DataFrame):
     df = _apply_range_mask(df, "atr", atr_rng)
 
     return df, notes
+
+
+def _lab_filter_df_params(df_in: pd.DataFrame, preset: dict) -> pd.DataFrame:
+    """Filter trades using a preset dict (same logic as Lab UI filters, but without Streamlit state)."""
+    if df_in is None or len(df_in) == 0:
+        return df_in
+
+    df = df_in.copy()
+
+    include_missing = preset.get("lab_include_missing", preset.get("include_missing", True))
+
+    # Direction filter
+    dirs_allowed = preset.get("lab_dirs_allowed", preset.get("dirs_allowed"))
+    dir_col = "dir_norm" if "dir_norm" in df.columns else _infer_col(df, ["dir_norm", "dir", "direction", "side"])
+    if dirs_allowed is not None and dir_col and dir_col in df.columns:
+        if include_missing:
+            m = df[dir_col].isna() | df[dir_col].isin(dirs_allowed)
+        else:
+            m = df[dir_col].isin(dirs_allowed)
+        df = df[m]
+
+    # Hour labels (entry hour buckets)
+    hours_allowed = preset.get("lab_hours_allowed", preset.get("hours_allowed"))
+    if hours_allowed:
+        if "hour_label" not in df.columns:
+            ts_col = _infer_col(df, ["entry_ts", "entryTime", "entry_time", "ts_entry"])
+            if ts_col and ts_col in df.columns:
+                ts = pd.to_datetime(df[ts_col], errors="coerce")
+                df["hour_label"] = ts.dt.hour.apply(lambda h: _hour_label(int(h)) if pd.notna(h) else np.nan)
+
+        if "hour_label" in df.columns:
+            if include_missing:
+                m = df["hour_label"].isna() | df["hour_label"].isin(hours_allowed)
+            else:
+                m = df["hour_label"].isin(hours_allowed)
+            df = df[m]
+
+    # OR size filter
+    or_rng = preset.get("lab_or_rng", preset.get("or_rng"))
+    or_col = "or_size" if "or_size" in df.columns else _infer_col(df, ["or_size", "orSize", "or", "OR", "or_range", "orRange"])
+    if or_rng and or_col and or_col in df.columns:
+        lo, hi = float(or_rng[0]), float(or_rng[1])
+        series = pd.to_numeric(df[or_col], errors="coerce")
+        if include_missing:
+            m = series.isna() | ((series >= lo) & (series <= hi))
+        else:
+            m = (series >= lo) & (series <= hi)
+        df = df[m]
+
+    # ATR filter
+    atr_rng = preset.get("lab_atr_rng", preset.get("atr_rng"))
+    atr_col = "atr" if "atr" in df.columns else _infer_col(df, ["atr", "ATR", "atr_val", "atr_value"])
+    if atr_rng and atr_col and atr_col in df.columns:
+        lo, hi = float(atr_rng[0]), float(atr_rng[1])
+        series = pd.to_numeric(df[atr_col], errors="coerce")
+        if include_missing:
+            m = series.isna() | ((series >= lo) & (series <= hi))
+        else:
+            m = (series >= lo) & (series <= hi)
+        df = df[m]
+
+    return df
+
+
+def _pnl_pf_dd_stats(df: pd.DataFrame, pnl_col: str):
+    """Return (pnl_sum, profit_factor, max_drawdown) for a subset of trades."""
+    if df is None or len(df) == 0 or (pnl_col not in df.columns):
+        return 0.0, 0.0, 0.0
+
+    s = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0.0)
+
+    pnl = float(s.sum())
+    pf = float(profit_factor(s))
+
+    eq = s.cumsum()
+    peaks = eq.cummax()
+    dd = float((eq - peaks).min()) if len(eq) else 0.0  # negative number (like the app shows)
+
+    return pnl, pf, dd
+
+
+def _safe_corr(a, b) -> float:
+    """Pearson correlation with NaN safety; returns 0 if not enough data."""
+    try:
+        if a is None or b is None:
+            return 0.0
+        sa = pd.to_numeric(pd.Series(a), errors="coerce")
+        sb = pd.to_numeric(pd.Series(b), errors="coerce")
+        m = sa.notna() & sb.notna()
+        if m.sum() < 3:
+            return 0.0
+        val = sa[m].corr(sb[m])
+        return float(val) if pd.notna(val) else 0.0
+    except Exception:
+        return 0.0
 
 
 def _simulate_daily_rules(df_in: pd.DataFrame,
