@@ -81,7 +81,7 @@ def recommend_settings_block(known_df: pd.DataFrame, min_trades: int, recommende
 
     n_total = int(len(known_df))
     st.subheader("🎯 Ajustes sugeridos (según esta muestra)")
-    st.caption("Esto NO es una optimización científica; es una guía rápida. Con poca muestra, úsalo como hipótesis.")
+    st.caption("🧪 Turbo Lab: genera *Top 10 presets* (🚀 PnL / 🛟 DD / ⚖️ Balance). Ojo: selecciona abajo en el radio, no clickeando la tabla.")
 
     if n_total < recommended_trades:
         st.warning(f"Muestra pequeña: {n_total} trades con ENTRY. Recomendado ≥ {recommended_trades} para decisiones fuertes.")
@@ -2981,6 +2981,23 @@ with st.expander("🚀 Turbo Optimus — Presets automáticos (1 click)", expand
         prog.empty()
 
     results = st.session_state.get("_turbo_results", []) or []
+    # --- Turbo safety: Streamlit state can keep old results after updates ---
+    # Keep only rows with a preset + metrics; if metrics missing, recompute.
+    _raw_results = results
+    _clean_results = []
+    for _r in _raw_results:
+        if not isinstance(_r, dict) or "preset" not in _r:
+            continue
+        if "met" not in _r or not isinstance(_r.get("met"), dict):
+            try:
+                _r = dict(_r)
+                _r["met"] = _turbo_eval_preset(df_real, _r["preset"])
+            except Exception:
+                continue
+        _clean_results.append(_r)
+    results = _clean_results
+    st.session_state["_turbo_results"] = results
+
     if not results:
         st.caption("Tip: si te salen resultados raros (PnL 0 / trades 0), casi siempre es porque los filtros dejan demasiado poco sample.")
     else:
