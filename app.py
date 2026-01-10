@@ -1906,6 +1906,29 @@ def _finite_minmax(s: pd.Series):
 
 
 
+
+def _hour_labels_list(df: pd.DataFrame) -> list:
+    """Return sorted hour-bucket labels present in the dataframe (based on entry timestamp if available)."""
+    if df is None or len(df) == 0:
+        return []
+    ts_col = _infer_col(df, ["entry_ts","entry_time","ts","time","datetime","date","exit_ts","exit_time"])
+    if ts_col is None or ts_col not in df.columns:
+        return []
+    s = pd.to_datetime(df[ts_col], errors="coerce")
+    if s.isna().all():
+        return []
+    hrs = s.dt.hour.dropna().astype(int)
+    if hrs.empty:
+        return []
+    keep = sorted(set(int(h) for h in hrs.unique() if pd.notna(h)))
+    labels = []
+    for h in keep:
+        try:
+            labels.append(_hour_label(pd.Timestamp("2000-01-01") + pd.Timedelta(hours=int(h))))
+        except Exception:
+            continue
+    return labels
+
 def _lab_quick_suggestions(t: pd.DataFrame, min_bucket: int = 5) -> dict:
     """Heurísticas rápidas basadas en tu historial REAL (no simulado).
     Devuelve un dict con llaves opcionales:
