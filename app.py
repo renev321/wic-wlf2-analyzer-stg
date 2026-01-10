@@ -2821,6 +2821,21 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             rows.append(_row_from(pr["name"], pr["params"], m))
 
         df_rows = pd.DataFrame(rows)
+        # Ensure BASE is always selectable (no filters)
+        try:
+            base_row = {
+                'name': 'BASE (sin filtros)',
+                'params': base_preset,
+                'trades': int(base.get('trades', 0) or 0),
+                'pnl': float(base.get('pnl', 0.0) or 0.0),
+                'dd': float(base.get('dd', 0.0) or 0.0),
+                'pf': float(base.get('pf', np.nan)),
+                'bal': float(base.get('bal', 0.0) or 0.0),
+                'ok': True,
+            }
+            df_rows = pd.concat([pd.DataFrame([base_row]), df_rows], ignore_index=True)
+        except Exception:
+            pass
         if df_rows.empty:
             return None
 
@@ -2828,9 +2843,25 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         df_ok = df_rows[df_rows["ok"]].copy() if (df_rows["ok"].any()) else df_rows.copy()
 
         # Rankings
-        rocket = df_ok.sort_values(["pnl", "dd", "trades", "pf"], ascending=[False, True, False, False]).head(10)
+        df_for_rocket = df_ok
+        try:
+            base_pnl_val = float(base.get('pnl', 0.0) or 0.0)
+            df_pos = df_ok[df_ok['pnl'] >= base_pnl_val]
+            if not df_pos.empty:
+                df_for_rocket = df_pos
+        except Exception:
+            pass
+        rocket = df_for_rocket.sort_values(["pnl", "dd", "trades", "pf"], ascending=[False, True, False, False]).head(10)
         sub    = df_ok.sort_values(["dd", "pnl", "trades"], ascending=[True, False, False]).head(10)
-        tuned  = df_ok.sort_values(["bal", "pnl", "dd", "trades"], ascending=[False, False, True, False]).head(10)
+        df_for_tuned = df_ok
+        try:
+            base_pnl_val = float(base.get('pnl', 0.0) or 0.0)
+            df_pos = df_ok[df_ok['pnl'] >= base_pnl_val]
+            if not df_pos.empty:
+                df_for_tuned = df_pos
+        except Exception:
+            pass
+        tuned  = df_for_tuned.sort_values(["bal", "pnl", "dd", "trades"], ascending=[False, False, True, False]).head(10)
 
         return {"base": base_m, "all": df_rows, "rocket": rocket, "sub": sub, "tuned": tuned}
 
@@ -2950,6 +2981,14 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             _card(c3, "🎛️ Tuned (balance)", ranked.get("tuned"))
 
             st.divider()
+            view_df = ranked.get('all')
+            if view_df is None:
+                view_df = pd.DataFrame()
+            if (not isinstance(view_df, pd.DataFrame)):
+                try:
+                    view_df = pd.DataFrame(view_df)
+                except Exception:
+                    view_df = pd.DataFrame()
             if view_df is None or len(view_df) == 0:
                 st.write("No hay resultados para mostrar.")
             else:
