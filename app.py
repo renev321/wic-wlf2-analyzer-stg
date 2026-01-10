@@ -217,6 +217,52 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # Arrays (volumen/delta/OHLC) y métricas pre-entrada
 # ============================================================
+
+def _infer_col(df, candidates):
+    """Return the first matching column name in df for any of the candidate names.
+    Matching is robust: exact, case-insensitive, normalized (alnum only), then substring match.
+    Returns None if nothing matches.
+    """
+    if df is None:
+        return None
+    try:
+        cols = list(df.columns)
+    except Exception:
+        return None
+    if not cols:
+        return None
+
+    # 1) exact + case-insensitive
+    lower_map = {str(c).lower(): c for c in cols}
+    for cand in (candidates or []):
+        cand_s = str(cand)
+        if cand_s in cols:
+            return cand_s
+        lc = cand_s.lower()
+        if lc in lower_map:
+            return lower_map[lc]
+
+    # 2) normalized (keep only a-z0-9)
+    def _norm(s):
+        return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+    norm_map = {_norm(c): c for c in cols}
+    for cand in (candidates or []):
+        n = _norm(cand)
+        if n in norm_map:
+            return norm_map[n]
+
+    # 3) substring match on normalized strings
+    for cand in (candidates or []):
+        n = _norm(cand)
+        if not n:
+            continue
+        for c in cols:
+            if n in _norm(c):
+                return c
+
+    return None
+
 def _as_list(x):
     """Convierte a lista si viene como list/tuple/np.array o string tipo '[...]'."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
