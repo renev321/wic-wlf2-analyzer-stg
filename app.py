@@ -1999,19 +1999,54 @@ def _apply_filters(df_in: pd.DataFrame):
     def _range_slider_for(col: str, key: str, title: str, unit_hint: str = ""):
         if col not in df.columns:
             return None
-        lo0, hi0 = _finite_minmax(df[col]) if "_finite_minmax" in globals() else (None, None)
+
+        lo0, hi0 = (None, None)
+        if "_finite_minmax" in globals():
+            lo0, hi0 = _finite_minmax(df[col])
+
         if lo0 is None or hi0 is None:
             return None
-        # default: rango completo (no filtra)
-        default = st.session_state.get(key, (float(lo0), float(hi0)))
-        try:
-            default = (float(default[0]), float(default[1]))
-        except Exception:
-            default = (float(lo0), float(hi0))
 
-        step = max((float(hi0) - float(lo0)) / 200.0, 0.01)
-        label = f"{title}" + (f" ({unit_hint})" if unit_hint else "")
-        rng = st.slider(label, float(lo0), float(hi0), default, step=step, key=key)
+        lo0 = float(lo0)
+        hi0 = float(hi0)
+        if (not np.isfinite(lo0)) or (not np.isfinite(hi0)):
+            return None
+
+        if lo0 > hi0:
+            lo0, hi0 = hi0, lo0
+        if lo0 == hi0:
+            hi0 = lo0 + 1e-9  # avoid Streamlit edge-case
+
+        def _norm(val):
+            try:
+                if isinstance(val, (list, tuple)) and len(val) == 2:
+                    a = float(val[0])
+                    b = float(val[1])
+                else:
+                    return (lo0, hi0)
+                if (not np.isfinite(a)) or (not np.isfinite(b)):
+                    return (lo0, hi0)
+                a = max(lo0, min(hi0, a))
+                b = max(lo0, min(hi0, b))
+                if a > b:
+                    a, b = b, a
+                return (a, b)
+            except Exception:
+                return (lo0, hi0)
+
+        # If a previous run stored a weird value, fix it BEFORE creating the slider.
+        if key in st.session_state:
+            st.session_state[key] = _norm(st.session_state.get(key))
+
+        default = _norm(st.session_state.get(key, (lo0, hi0)))
+
+        span = hi0 - lo0
+        step = span / 50.0 if span > 0 else 1.0
+        if (not np.isfinite(step)) or step <= 0:
+            step = 1.0
+
+        label = f"{title} {unit_hint}".strip()
+        rng = st.slider(label, lo0, hi0, default, step=step, key=key)
         return rng
 
     # --- helper: aplicar rango inclusivo (con opción de incluir NaN) ---
@@ -2915,24 +2950,49 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             _card(c3, "🎛️ Tuned (balance)", ranked.get("tuned"))
 
             st.divider()
-            pick = st.radio("Ver top", ["Rocket", "Submarine", "Tuned", "Todos"], horizontal=True, key="turbo_view")
-            if pick == "Rocket":
-                view_df = ranked.get("rocket")
-            elif pick == "Submarine":
-                view_df = ranked.get("sub")
-            elif pick == "Tuned":
-                view_df = ranked.get("tuned")
-            else:
-                view_df = ranked.get("all")
-
-            if view_df is not None and len(view_df)>0:
-                show = view_df[["name","pnl","dd","trades","pf","bal"]].copy()
-                st.dataframe(show, use_container_width=True, height=280)
-                idx = st.selectbox("Aplicar un preset de la lista", options=list(range(len(view_df))), format_func=lambda i: view_df.iloc[i]["name"], key="turbo_pick")
-                if st.button("Aplicar preset seleccionado", key="turbo_apply_pick"):
-                    _apply_preset(view_df.iloc[idx]["params"])
-            else:
+            if view_df is None or len(view_df) == 0:
                 st.write("No hay resultados para mostrar.")
+            else:
+                base_m = ranked.get("base") or {}
+                base_pnl = float(base_m.get("pnl", 0.0) or 0.0)
+                base_dd  = float(base_m.get("dd", 0.0) or 0.0)
+                base_tr  = int(base_m.get("trades", 0) or 0)
+
+                def _fmt_money(x):
+                    try:
+                        if x is None:
+                            return "—"
+                        x = float(x)
+                        if (not np.isfinite(x)):
+                            return "—"
+                        return f"{x:,.0f}"
+                    except Exception:
+                        return "—"
+
+                show = view_df[["name","pnl","dd","trades","pf","bal"]].copy()
+                show["ΔPnL"] = show["pnl"] - base_pnl
+                show["ΔDD"]  = show["dd"] - base_dd
+
+                show_disp = pd.DataFrame({
+                    "Preset": show["name"],
+                    "PnL": show["pnl"].map(_fmt_money),
+                    "ΔPnL vs Base": show["ΔPnL"].map(_fmt_money),
+                    "MaxDD": show["dd"].map(_fmt_money),
+                    "ΔDD vs Base": show["ΔDD"].map(_fmt_money),
+                    "Trades": show["trades"].astype(int),
+                    "PF": show["pf"].round(2),
+                    "Balance": show["bal"].round(2),
+                })
+
+                st.caption(
+                    f"Base (referencia): PnL {_fmt_money(base_pnl)} | MaxDD {_fmt_money(base_dd)} | Trades {base_tr}"
+                )
+                st.table(show_disp.head(10))
+
+                apply_name = st.selectbox("Aplicar preset", list(view_df["name"]), key="turbo_apply_pick")
+                if st.button("✅ Aplicar este preset", key="turbo_apply_btn"):
+                    params = view_df.loc[view_df["name"] == apply_name, "params"].iloc[0]
+                    _apply_preset(params)
 with lab_right:
     st.markdown("**Filtros (opcional)**")
     base_for_lab = t.copy()  # <-- mismo universo que Resumen rápido
