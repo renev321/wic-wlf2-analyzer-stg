@@ -2285,7 +2285,9 @@ def _simulate_daily_rules(df_in: pd.DataFrame,
                           max_trades: int = 0,
                           max_consec_losses: int = 0,
                           stop_big_loss: bool = False,
-                          stop_big_win: bool = False):
+                          stop_big_win: bool = False,
+                          rr_stop_loss: float = -1.0,
+                          rr_stop_win: float = 2.0):
     """
     Simula reglas tipo 'Daily Guard' sobre un dataframe ya filtrado.
 
@@ -2373,9 +2375,9 @@ def _simulate_daily_rules(df_in: pd.DataFrame,
                     cut_reason = "Máx ganancia/día"
                 elif max_consec_losses > 0 and consec >= max_consec_losses:
                     cut_reason = f"{max_consec_losses} pérdidas seguidas"
-                elif bool(stop_big_loss) and np.isfinite(rr) and float(rr) <= -1.0:
+                elif bool(stop_big_loss) and np.isfinite(rr) and float(rr) <= rr_stop_loss:
                     cut_reason = "Stop‑out fuerte (≤ -1R)"
-                elif bool(stop_big_win) and np.isfinite(rr) and float(rr) >= 2.0:
+                elif bool(stop_big_win) and np.isfinite(rr) and float(rr) >= rr_stop_win:
                     cut_reason = "Ganador grande (≥ 2R)"
 
             if cut_reason is not None:
