@@ -2724,8 +2724,26 @@ with st.expander("🚀 Turbo Optimus — Top 10 Presets (PnL ↑ / DD ↓ / Bala
         min_trades = ranked.get("min_trades", 0)
 
         if base:
-            st.write(f"**Base (referencia):** PnL {base['pnl']:.0f} | MaxDD {base['maxdd']:.0f} | Trades {base['trades']} | PF {base['pf']:.2f}")
+            def _fmt_num(x, fmt='.0f', na='—'):
+                try:
+                    if x is None:
+                        return na
+                    if isinstance(x, float) and (x != x):
+                        return na
+                    return format(float(x), fmt)
+                except Exception:
+                    return na
 
+            base_pnl    = base.get('pnl', base.get('PnL')) if isinstance(base, dict) else None
+            base_maxdd  = base.get('maxdd', base.get('max_dd')) if isinstance(base, dict) else None
+            base_trades = base.get('trades') if isinstance(base, dict) else None
+            base_pf     = base.get('pf', base.get('PF')) if isinstance(base, dict) else None
+            st.write(
+                f"**Base (referencia):** PnL {_fmt_num(base_pnl, '.0f')} | "
+                f"MaxDD {_fmt_num(base_maxdd, '.0f')} | "
+                f"Trades {_fmt_num(base_trades, '.0f')} | "
+                f"PF {_fmt_num(base_pf, '.2f')}"
+            )
         if not top10:
             st.warning(f"No encontré presets con suficientes trades. (mínimo requerido: {min_trades})")
         else:
