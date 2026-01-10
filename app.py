@@ -6,6 +6,18 @@ import plotly.express as px
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
+# --- TURBO: apply queued preset before widgets are created (prevents session_state/widget-key errors)
+if "_turbo_pending_apply" in st.session_state:
+    _params = st.session_state.pop("_turbo_pending_apply") or {}
+    if isinstance(_params, dict):
+        for _k, _v in _params.items():
+            st.session_state[_k] = _v
+    # Ensure these exist even if user never touched the toggles
+    st.session_state.setdefault("lab_use_hours_filter", False)
+    st.session_state.setdefault("lab_use_or_filter", False)
+    st.session_state.setdefault("lab_use_atr_filter", False)
+    st.session_state.setdefault("lab_use_rules", True)
+
 def _best_group_for_categorical(df: pd.DataFrame, col: str, min_trades: int):
     if col not in df.columns:
         return None
@@ -2741,30 +2753,37 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         return {"name": name, "params": params}
 
     def _rank_presets(df, presets, min_trades=30):
+        # Always include the BASE (no filters) so "Rocket" can never be worse than doing nothing.
         base = _make_preset("Base (sin filtros)")
-        base_m = _turbo_metrics(df, base["params"]) or {"pnl":0.0,"dd":float('inf'),"trades":0,"pf":float('nan')}
+        base_m = _turbo_metrics(df, base["params"]) or {"pnl": 0.0, "dd": float("inf"), "trades": 0, "pf": float("nan")}
 
-        rows=[]
-        for pr in presets:
+        rows = []
+
+        def _row_from(name, params, m):
+            pnl = float(m.get("pnl", 0.0))
+            dd  = float(m.get("dd", float("inf")))
+            trades = int(m.get("trades", 0))
+            pf = m.get("pf", float("nan"))
+            bal = (pnl / dd) if (dd and dd != 0 and dd != float("inf")) else (pnl if dd == 0 else 0.0)
+            return {
+                "name": name,
+                "params": params,
+                "trades": trades,
+                "pnl": pnl,
+                "dd": dd,
+                "pf": pf,
+                "bal": bal,
+            }
+
+        # BASE row
+        rows.append(_row_from(base["name"], base["params"], base_m))
+
+        # Candidate presets
+        for pr in (presets or []):
             m = _turbo_metrics(df, pr["params"])
             if not m:
                 continue
-            trades = m["trades"]
-            pnl = m["pnl"]
-            dd = m["dd"]
-            pf = m["pf"]
-            bal = (pnl / dd) if (dd and dd!=0 and dd!=float('inf')) else (pnl if dd==0 else 0.0)
-            rows.append({
-                "name": pr["name"],
-                "params": pr["params"],
-                "trades": trades,
-                "pnl": pnl,
-                "dd": dd if dd!=float('inf') else float('nan'),
-                "pf": pf,
-                "bal": bal,
-                "delta_pnl": pnl - float(base_m.get("pnl",0.0)),
-                "delta_dd": (dd - float(base_m.get("dd",dd))) if (base_m.get("dd") not in [None, float('inf')]) else float('nan'),
-            })
+            rows.append(_row_from(pr["name"], pr["params"], m))
 
         df_rows = pd.DataFrame(rows)
         if df_rows.empty:
@@ -2773,22 +2792,19 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         df_rows["ok"] = df_rows["trades"] >= int(min_trades)
         df_ok = df_rows[df_rows["ok"]].copy() if (df_rows["ok"].any()) else df_rows.copy()
 
-        rocket = df_ok.sort_values(["pnl","pf"], ascending=False).head(10)
-        sub    = df_ok[(df_ok["pnl"]>0)].sort_values(["dd","pnl"], ascending=[True, False]).head(10)
-        tuned  = df_ok.sort_values(["bal","pnl"], ascending=False).head(10)
+        # Rankings
+        rocket = df_ok.sort_values(["pnl", "dd", "trades", "pf"], ascending=[False, True, False, False]).head(10)
+        sub    = df_ok.sort_values(["dd", "pnl", "trades"], ascending=[True, False, False]).head(10)
+        tuned  = df_ok.sort_values(["bal", "pnl", "dd", "trades"], ascending=[False, False, True, False]).head(10)
 
         return {"base": base_m, "all": df_rows, "rocket": rocket, "sub": sub, "tuned": tuned}
 
     def _apply_preset(params: dict):
-        for k, v in params.items():
-            st.session_state[k] = v
-        # Asegura que toggles existan incluso si el user nunca los tocó
-        st.session_state.setdefault("lab_use_hours_filter", False)
-        st.session_state.setdefault("lab_use_or_filter", False)
-        st.session_state.setdefault("lab_use_atr_filter", False)
+        # Queue the changes; they’ll be applied at the top of the next rerun (before widgets exist)
+        st.session_state["_turbo_pending_apply"] = dict(params or {})
+        st.session_state["_turbo_applied_flash"] = True
         st.rerun()
 
-    # UI
     if df_real is None or df_real.empty:
         st.info("Turbo necesita datos cargados (trades) para proponer presets.")
     else:
