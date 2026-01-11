@@ -2735,11 +2735,32 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         return pd.to_numeric(s, errors="coerce")
 
     def _turbo_get_cols(df):
+        # Detect columns robustly for your WIC_WLF2 trade dataframe
         pnl_col  = _infer_col(df, ["tradeRealized","realized","pnl","PnL","pnl_usd","pnl$","profit","pl"])
-        hour_col = _infer_col(df, ["entry_hour","hour","Hour","trade_hour","entryHour"])
+        # Hour: prefer precomputed entry_hour; otherwise derive from entry_time
+        hour_col = _infer_col(df, ["entry_hour","entryHour","hour","Hour","trade_hour"])
         atr_col  = _infer_col(df, ["atr","ATR","atr_points","atrPts","atr_pt"])
-        or_col   = _infer_col(df, ["or_rng","or_range","OR","orPoints","or_pts","opening_range","or"])
-        ts_col   = _infer_col(df, ["exit_ts","exitTs","ts","timestamp","time","ExitTime","exit_time","date"])
+        # OR: your jsonl has orSize, and sometimes orHigh/orLow
+        or_col   = _infer_col(df, ["orSize","or_size","or_rng","or_range","orPoints","or_pts","opening_range","or"])
+        # Timestamp for equity order: prefer exit_time
+        ts_col   = _infer_col(df, ["exit_time","exit_ts","exitTs","ts_exit","timestamp_exit","ts","timestamp","time","ExitTime","date"])
+
+        d = df
+        # Build temporary hour if needed
+        if hour_col is None:
+            et_col = _infer_col(d, ["entry_time","entry_ts","entryTime","EntryTime","ts_entry"])
+            if et_col is not None and et_col in d.columns:
+                d["_tmp_entry_hour"] = pd.to_datetime(d[et_col], errors="coerce").dt.hour
+                hour_col = "_tmp_entry_hour"
+
+        # Build temporary orSize if needed
+        if or_col is None:
+            oh = _infer_col(d, ["orHigh","or_high"])
+            ol = _infer_col(d, ["orLow","or_low"])
+            if oh is not None and ol is not None and oh in d.columns and ol in d.columns:
+                d["_tmp_orSize"] = pd.to_numeric(d[oh], errors="coerce") - pd.to_numeric(d[ol], errors="coerce")
+                or_col = "_tmp_orSize"
+
         return pnl_col, hour_col, atr_col, or_col, ts_col
 
     def _max_dd_from_pnl(df, pnl_col, ts_col):
@@ -2762,126 +2783,61 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         return float(dd) if dd is not None else float("inf")
 
     def _turbo_metrics(df, params):
-        """Métricas usando la MISMA lógica que 'Aplicar': filtros + simulación de reglas diarias."""
-        pnl_col, hour_col, atr_col, or_col, ts_col = _turbo_get_cols(df)
-        if not pnl_col:
+        """Evalúa un preset con el MISMO pipeline del Lab/Aplicar:
+        1) filtros (horas/dir/OR/ATR)
+        2) reglas diarias (max trades / max loss / max consec)
+        3) métricas (PnL, DD, PF)
+        Devuelve también trades_filt y trades_sim para diagnóstico y para el mínimo de muestra.
+        """
+        if df is None or df.empty:
             return None
 
         # 1) filtros
-        df_f = _lab_filter_df_params(df, params)
-        if df_f is None or df_f.empty:
-            return {"trades": 0, "pnl": 0.0, "dd": float("inf"), "pf": float("nan")}
+        filt = _lab_filter_df_params(df, params)
 
-        df_work = df_f.copy()
-        df_work["tradeRealized"] = _turbo_safe_num(df_work[pnl_col]).fillna(0.0)
+        # conteo antes de reglas (esto es lo que usamos para "mín trades")
+        trades_filt = int(len(filt)) if filt is not None else 0
+        if trades_filt <= 0:
+            return None
 
-        # 2) reglas diarias (simulación)
-        max_loss = float(params.get("lab_max_loss", 0.0) or 0.0)
-        max_profit = float(params.get("lab_max_profit", 0.0) or 0.0)
-        max_trades = int(params.get("lab_max_trades", 0) or 0)
-        max_consec_losses = int(params.get("lab_max_consec_losses", 0) or 0)
-        stop_big_loss = bool(params.get("lab_stop_big_loss", False))
-        stop_big_win  = bool(params.get("lab_stop_big_win", False))
-
-        if bool(params.get("lab_use_rules", True)):
-            df_sim, _ = _simulate_daily_rules(
-                df_work,
-                max_loss=max_loss,
-                max_profit=max_profit,
-                max_trades=max_trades,
-                max_consec_losses=max_consec_losses,
-                stop_big_loss=stop_big_loss,
-                stop_big_win=stop_big_win,
-            )
+        # 2) reglas (si lab_use_rules=False, no corta nada)
+        use_rules = bool(params.get("lab_use_rules", True))
+        if not use_rules:
+            sim_kept = filt.copy()
+            stops_df = pd.DataFrame()
         else:
-            df_sim = df_work
+            max_loss = float(params.get("lab_max_loss", 0) or 0)
+            max_trades = int(params.get("lab_max_trades", 0) or 0)
+            max_consec_losses = int(params.get("lab_max_consec_losses", 0) or 0)
+            stop_big_loss = bool(params.get("lab_stop_big_loss", False))
+            stop_big_win  = bool(params.get("lab_stop_big_win", False))
+            sim_kept, stops_df = _simulate_daily_rules(
+                filt, max_loss, max_trades, max_consec_losses, stop_big_loss, stop_big_win
+            )
 
-        if df_sim is None or df_sim.empty:
-            return {"trades": 0, "pnl": 0.0, "dd": float("inf"), "pf": float("nan")}
+        trades_sim = int(len(sim_kept)) if sim_kept is not None else 0
 
-        pnl = float(_turbo_safe_num(df_sim["tradeRealized"]).fillna(0.0).sum())
-        dd  = _max_dd_from_pnl(df_sim, "tradeRealized", ts_col) if ts_col else _max_dd_from_pnl(df_sim, "tradeRealized", None)
-        pf  = profit_factor(df_sim) if len(df_sim) else float("nan")
-        return {"trades": int(len(df_sim)), "pnl": pnl, "dd": float(dd), "pf": pf}
+        # 3) métricas
+        pnl_col, _, _, _, ts_col = _turbo_get_cols(df)
+        if not pnl_col or pnl_col not in sim_kept.columns:
+            return None
 
-    def _fmt_money(x):
-        try:
-            x = float(x)
-        except Exception:
-            return "—"
-        sign = "+" if x > 0 else ""
-        return f"{sign}{x:,.0f}"
+        pnl_sim = float(pd.to_numeric(sim_kept[pnl_col], errors="coerce").fillna(0.0).sum())
 
-    def _fmt_pf(x):
-        try:
-            x = float(x)
-        except Exception:
-            return "—"
-        if np.isnan(x):
-            return "—"
-        return f"{x:.2f}"
+        # DD sobre la curva equity (ordenada por timestamp si existe)
+        dd_sim = _max_dd_from_pnl(sim_kept, pnl_col, ts_col)
 
-    def _fmt_dd(x):
-        if x is None:
-            return "—"
-        try:
-            x = float(x)
-        except Exception:
-            return "—"
-        if x == float("inf") or np.isnan(x):
-            return "—"
-        return f"{x:,.0f}"
+        pf_sim = profit_factor(sim_kept[pnl_col]) if (pnl_col in sim_kept.columns and trades_sim > 0) else np.nan
 
-    def _hours_best_sets(df, hour_col, pnl_col):
-        if not hour_col or hour_col not in df.columns:
-            return [("Todo el día", None)]
-        h = pd.to_numeric(df[hour_col], errors="coerce")
-        p = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0.0)
-        d = pd.DataFrame({"h": h, "p": p}).dropna(subset=["h"])
-        if d.empty:
-            return [("Todo el día", None)]
-        g = d.groupby("h")["p"].sum().sort_values(ascending=False)
-        top = [int(x) for x in g.index[:6] if pd.notna(x)]
-        sets = [("Todo el día", None)]
-        if len(top) >= 3:
-            sets.append(("Top 3 horas", top[:3]))
-        if len(top) >= 5:
-            sets.append(("Top 5 horas", top[:5]))
-        return sets
-
-    def _hours_to_labels(hours_list):
-        if not hours_list:
-            return []
-        return [f"{int(h):02d}:00" for h in hours_list]
-
-    def _top_bins_for(df, x_col, pnl_col, top_k=2):
-        if (not x_col) or (x_col not in df.columns) or (not pnl_col) or (pnl_col not in df.columns):
-            return []
-        x = pd.to_numeric(df[x_col], errors="coerce")
-        p = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0.0)
-        dfb = pd.DataFrame({"x": x, "p": p}).dropna(subset=["x"])
-        if dfb.empty:
-            return []
-        qs = dfb["x"].quantile([0.05, 0.25, 0.50, 0.75, 0.95]).values.tolist()
-        qs = [float(q) for q in qs if pd.notna(q)]
-        qs = sorted(set(qs))
-        if len(qs) < 2:
-            return []
-        try:
-            dfb["bin"] = pd.cut(dfb["x"], bins=qs, include_lowest=True)
-        except Exception:
-            return []
-        g = dfb.groupby("bin")["p"].agg(["sum", "count", "mean"]).reset_index()
-        g = g[g["count"] >= max(10, int(len(dfb) * 0.02))]
-        if g.empty:
-            return []
-        g = g.sort_values(["sum", "mean"], ascending=False)
-        out = []
-        for _, r in g.head(int(top_k)).iterrows():
-            b = r["bin"]
-            if hasattr(b, "left"):
-                out.append((float(b.left), float(b.right)))
-        return out
+        return {
+            "pnl": pnl_sim,
+            "dd": float(dd_sim) if dd_sim is not None else float("inf"),
+            "pf": float(pf_sim) if pf_sim is not None else float("nan"),
+            "trades": trades_sim,
+            "trades_filt": trades_filt,
+            "trades_sim": trades_sim,
+            "stops_df": stops_df,
+        }
 
     def _make_params(hours=None, or_rng=None, atr_rng=None, max_trades=0, max_loss=0, max_consec=0, dirs_allowed=None):
         # Nota clave: si NO pasamos 'lab_dirs_allowed', _lab_filter_df_params usa defaults
@@ -3021,32 +2977,38 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                     or_bins  = _top_bins_for(df_real, or_col, pnl_col, top_k=int(top_bins)) if or_col else []
                     atr_bins = _top_bins_for(df_real, atr_col, pnl_col, top_k=int(top_bins)) if atr_col else []
 
-                    max_trades_opts = [0, 2, 3, 4]
-                    max_loss_opts   = [0, 400, 600, 800]
-                    max_consec_opts = [0, 2, 3]
+                    # Grid de reglas (más profundo, pero controlado)
+                    max_trades_opts = [0, 1, 2, 3, 4, 5]
+                    max_loss_opts   = [0, 200, 300, 400, 500, 600, 800, 1000]
+                    max_consec_opts = [0, 1, 2, 3, 4]
 
                     or_opts  = [None] + or_bins
                     atr_opts = [None] + atr_bins
 
-                    cap = 500
+                    cap = 1200
                     rows = []
+                    attempted = 0
+                    kept = 0
                     for hs_name, hs in hour_sets:
                         for or_rng in or_opts:
                             for atr_rng in atr_opts:
                                 for mt in max_trades_opts:
                                     for ml in max_loss_opts:
                                         for mc in max_consec_opts:
+                                            attempted += 1
                                             params = _make_params(hours=hs, or_rng=or_rng, atr_rng=atr_rng, max_trades=mt, max_loss=ml, max_consec=mc, dirs_allowed=turbo_dirs_allowed)
                                             m = _turbo_metrics(df_real, params)
                                             if not m:
                                                 continue
-                                            if int(m.get("trades", 0)) < int(min_trades):
+                                            # Mín trades se valida ANTES de reglas (muestra filtrada)
+                                            if int(m.get("trades_filt", m.get("trades", 0))) < int(min_trades):
                                                 continue
                                             pnl = float(m.get("pnl", 0.0))
                                             dd  = float(m.get("dd", float("inf")))
                                             pf  = float(m.get("pf", float("nan")))
                                             d_pnl = pnl - float(cur_m.get("pnl", 0.0))
                                             d_dd  = float(cur_m.get("dd", float("inf"))) - dd
+                                            kept += 1
                                             rows.append({
                                                 "params": params,
                                                 "pnl": pnl, "dd": dd, "pf": pf, "trades": int(m.get("trades", 0)),
@@ -3069,11 +3031,15 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                         st.warning("Turbo no encontró presets válidos con la muestra mínima. Baja 'Mín trades' o revisa columnas OR/ATR/hora.")
                     else:
                         df_rows = pd.DataFrame(rows)
-                        df_rows["_k"] = (
-                            df_rows["pnl"].round(2).astype(str) + "|" +
-                            df_rows["dd"].round(2).astype(str) + "|" +
-                            df_rows["pf"].round(2).astype(str) + "|" +
-                            df_rows["trades"].astype(str)
+                        df_rows["_k"] = df_rows["params"].apply(
+                            lambda p: (
+                                "H:" + ",".join((p or {}).get("lab_hours_allowed", []) or []) +
+                                "|OR:" + str((p or {}).get("lab_or_rng", None)) +
+                                "|ATR:" + str((p or {}).get("lab_atr_rng", None)) +
+                                "|T:" + str((p or {}).get("lab_max_trades", 0)) +
+                                "|L:" + str((p or {}).get("lab_max_loss", 0)) +
+                                "|C:" + str((p or {}).get("lab_max_consec_losses", 0))
+                            )
                         )
 
                         obj = st.session_state.get("turbo_obj", "🚀 Rocket (máximo PnL)")
@@ -3094,6 +3060,20 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                             label = "Balance"
 
                         df_rank = df_rank.drop_duplicates("_k", keep="first").head(10).reset_index(drop=True)
+                        st.session_state["turbo_diag"] = {
+                            "universe_trades": int(len(df_real)) if df_real is not None else 0,
+                            "attempted": int(attempted),
+                            "kept": int(kept),
+                            "hour_sets": int(len(hour_sets)) if hour_sets is not None else 0,
+                            "or_bins": int(len(or_bins)) if or_bins is not None else 0,
+                            "atr_bins": int(len(atr_bins)) if atr_bins is not None else 0,
+                            "pnl_col": pnl_col,
+                            "hour_col": hour_col,
+                            "or_col": or_col,
+                            "atr_col": atr_col,
+                            "ts_col": ts_col,
+                            "min_trades": int(min_trades),
+                        }
                         st.session_state["turbo_ranked_df"] = df_rank
                         st.session_state["turbo_rank_label"] = label
                         st.session_state["turbo_rank_icon"] = icon
@@ -3151,6 +3131,15 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
             if (ranked_df["d_pnl"].abs().max() < 1e-9) and (ranked_df["d_dd"].abs().max() < 1e-9):
                 st.warning("Turbo no ve diferencias entre presets. Suele pasar si OR/ATR no tienen datos útiles o si el universo es muy constante.")
+
+            with st.expander("🧪 Turbo Diagnóstico (qué combinó y por qué)", expanded=False):
+                diag = st.session_state.get("turbo_diag", {})
+                if diag:
+                    st.json(diag)
+                else:
+                    st.write("—")
+                st.caption("Si ves or_bins=0 o atr_bins=0, Turbo no pudo binarizar OR/ATR. "
+                           "Si attempted es alto pero kept es bajo, el mínimo de trades o las reglas están cortando demasiado.")
 
             if st.button("🎛️ Aplicar este preset", key="turbo_apply_btn"):
                 _apply_preset(params)
