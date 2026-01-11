@@ -3061,6 +3061,37 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             if st.button("🎛️ Aplicar este preset", key="turbo_apply_btn"):
                 _apply_preset(params)
 
+    # Comparativa principal: REAL (historial) vs SIMULADO (filtros + reglas)
+    # (bloque defensivo: evita NameError si cambian nombres de variables)
+    # ------------------------------------------------------------
+    try:
+        real_df = base_for_lab
+    except Exception:
+        real_df = df_real if "df_real" in globals() else pd.DataFrame()
+
+    try:
+        cand_df = filtered
+    except Exception:
+        cand_df = real_df
+
+    try:
+        sim_df = sim_kept
+    except Exception:
+        sim_df = pd.DataFrame()
+
+    n_real = int(len(real_df)) if real_df is not None else 0
+    n_cand = int(len(cand_df)) if cand_df is not None else 0
+    n_sim  = int(len(sim_df))  if sim_df  is not None else 0
+
+    omit_filtros = max(0, n_real - n_cand)
+    omit_reglas  = max(0, n_cand - n_sim)
+
+    pnl_real = float(pd.to_numeric(real_df.get("tradeRealized"), errors="coerce").fillna(0.0).sum()) if (real_df is not None and not real_df.empty) else 0.0
+    pnl_sim  = float(pd.to_numeric(sim_df.get("tradeRealized"), errors="coerce").fillna(0.0).sum())  if (sim_df  is not None and not sim_df.empty)  else 0.0
+
+    pf_real = profit_factor(real_df) if (real_df is not None and not real_df.empty) else np.nan
+    pf_sim  = profit_factor(sim_df)  if (sim_df  is not None and not sim_df.empty)  else np.nan
+
     st.markdown("### 📊 Resultados del Lab (real vs simulado)")
     # Defaults defensivos (evita NameError si no se calculan aún)
     dd_base_f = np.nan
