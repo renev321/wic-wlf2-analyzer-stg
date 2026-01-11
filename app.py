@@ -2926,6 +2926,21 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             "lab_max_consec_losses": st.session_state.get("lab_max_consec_losses", 0),
         }
         cur_m = _turbo_metrics(df_real, current_params) or {"pnl": 0.0, "dd": float("inf"), "pf": float("nan"), "trades": 0}
+        # Si cambias filtros/reglas del Lab, invalida la caché de Turbo (evita deltas inconsistentes)
+        def _turbo_params_sig(p):
+            try:
+                import json as _json
+                return _json.dumps(p, sort_keys=True, default=str)
+            except Exception:
+                return str(p)
+
+        _cur_sig = _turbo_params_sig(current_params)
+        if st.session_state.get("turbo_cur_sig") != _cur_sig:
+            st.session_state["turbo_cur_sig"] = _cur_sig
+            st.session_state.pop("turbo_ranked_df", None)
+            st.session_state.pop("turbo_rank_label", None)
+            st.session_state.pop("turbo_rank_icon", None)
+
 
         colA, colB, colC = st.columns([1.1, 1.0, 1.9])
         with colA:
@@ -3020,12 +3035,18 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                         st.warning("Turbo no encontró presets válidos con la muestra mínima. Baja 'Mín trades' o revisa columnas OR/ATR/hora.")
                     else:
                         df_rows = pd.DataFrame(rows)
-                        df_rows["_k"] = (
-                            df_rows["pnl"].round(2).astype(str) + "|" +
-                            df_rows["dd"].round(2).astype(str) + "|" +
-                            df_rows["pf"].round(2).astype(str) + "|" +
-                            df_rows["trades"].astype(str)
-                        )
+
+                        # Diagnóstico rápido: si no hay bins/horas, muchos presets terminan siendo equivalentes
+                        if (len(hour_sets) <= 1) and (not or_bins) and (not atr_bins):
+                            st.info("Turbo no detectó variación suficiente en **horas/OR/ATR** (o no existen esas columnas). "
+                                    "En este caso, Turbo solo puede variar reglas diarias y es normal ver pocos presets distintos.")
+
+                        df_rows["_psig"] = df_rows["params"].apply(_turbo_params_sig)
+
+                        base_pnl = float(cur_m.get("pnl", 0.0))
+                        base_dd  = float(cur_m.get("dd", float("inf")))
+                        df_rows["d_pnl"] = df_rows["pnl"] - base_pnl
+                        df_rows["d_dd"]  = base_dd - df_rows["dd"]
 
                         obj = st.session_state.get("turbo_obj", "🚀 Rocket (máximo PnL)")
                         if obj.startswith("🚀"):
@@ -3044,7 +3065,19 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                             icon = "🎛️"
                             label = "Balance"
 
-                        df_rank = df_rank.drop_duplicates("_k", keep="first").head(10).reset_index(drop=True)
+                        # Selección diversa: evita colapsar a 1 solo preset cuando las métricas se repiten
+                        picked = []
+                        seen = set()
+                        for _, r in df_rank.iterrows():
+                            sig = r["_psig"]
+                            if sig in seen:
+                                continue
+                            seen.add(sig)
+                            picked.append(r)
+                            if len(picked) >= 10:
+                                break
+                        df_rank = pd.DataFrame(picked).reset_index(drop=True)
+
                         st.session_state["turbo_ranked_df"] = df_rank
                         st.session_state["turbo_rank_label"] = label
                         st.session_state["turbo_rank_icon"] = icon
@@ -3054,9 +3087,25 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             icon = st.session_state.get("turbo_rank_icon", "🚀")
             label = st.session_state.get("turbo_rank_label", "Opción")
 
+            def _rules_hint(p: dict) -> str:
+                mt = int(p.get("lab_max_trades", 0) or 0)
+                ml = float(p.get("lab_max_loss", 0.0) or 0.0)
+                mc = int(p.get("lab_max_consec_losses", 0) or 0)
+                parts = []
+                if mt:
+                    parts.append(f"máx {mt}/día")
+                if ml:
+                    parts.append(f"pérdida {ml:,.0f}/día")
+                if mc:
+                    parts.append(f"racha {mc}")
+                return "sin límite" if not parts else ", ".join(parts)
+
             def _opt_label(i, row):
-                pnl = float(row["pnl"]); dd=float(row["dd"]); pf=float(row["pf"]); tr=int(row["trades"])
-                d_pnl = float(row["d_pnl"]); d_dd=float(row["d_dd"])
+                pnl = float(row["pnl"]); dd = float(row["dd"]); pf = float(row["pf"]); tr = int(row["trades"])
+                # Delta siempre contra el estado actual (cur_m) para evitar inconsistencias visuales
+                d_pnl = pnl - float(cur_m.get("pnl", 0.0))
+                d_dd  = float(cur_m.get("dd", float("inf"))) - dd
+
                 if icon == "🚀":
                     delta = f"ΔPnL {_fmt_money(d_pnl)}"
                 elif icon == "🛟":
@@ -3064,7 +3113,9 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                     delta = f"ΔDD {sign}{d_dd:,.0f}"
                 else:
                     delta = f"Score {row['_score']:.3f}"
-                return f"{icon} {label} #{i+1} · {delta} · PnL {_fmt_money(pnl)} · DD {_fmt_dd(dd)} · PF {_fmt_pf(pf)} · Trades {tr}"
+
+                hint = _rules_hint(row.get("params", {}))
+                return f"{icon} {label} #{i+1} · {delta} · PnL {_fmt_money(pnl)} · DD {_fmt_dd(dd)} · PF {_fmt_pf(pf)} · Trades {tr} · Reglas: {hint}"
 
             options = [ _opt_label(i, ranked_df.iloc[i]) for i in range(len(ranked_df)) ]
             sel = st.selectbox("✅ Elige un preset (Turbo recomienda según tu objetivo):", options, index=0, key="turbo_sel")
