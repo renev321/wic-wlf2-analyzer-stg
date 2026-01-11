@@ -2520,31 +2520,54 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
         include_missing = bool(params.get("lab_include_missing", True))
 
-        # Dirección
+        # Dirección (robusto: soporta 1/-1, Long/Short, Buy/Sell, Compra/Venta)
         dir_col = _infer_col(d, ["dir_label", "dir", "direction", "tradeDirection"])
-        allowed_dirs = params.get("lab_dirs_allowed", ["Compra", "Venta", "No definida"])
+        allowed_dirs = params.get("lab_dirs_allowed", None)
+
         if dir_col is not None and allowed_dirs:
-            raw = d[dir_col]
-            dnum = pd.to_numeric(raw, errors="coerce")
-            raw_str = raw.astype(str).str.lower()
+            s = d[dir_col]
 
-            # Soporta logs con dir numérico (1/-1), o texto ("Long/Short"), o variantes ("buy/sell", "compra/venta")
-            is_long = (dnum > 0) | (dnum.isna() & raw_str.str.contains(r"\blong\b|\bbuy\b|compra|largo", regex=True))
-            is_short = (dnum < 0) | (dnum.isna() & raw_str.str.contains(r"\bshort\b|\bsell\b|venta|corto", regex=True))
-            is_unknown = (~(is_long | is_short)) | (dnum == 0)
+            # Match directo si el dataset ya usa las mismas etiquetas
+            direct_match = False
+            try:
+                direct_match = s.dropna().astype(str).isin([str(x) for x in allowed_dirs]).any()
+            except Exception:
+                direct_match = False
 
-            mask = pd.Series(False, index=d.index)
-            if "Compra" in allowed_dirs:
-                mask |= is_long
-            if "Venta" in allowed_dirs:
-                mask |= is_short
-            if "No definida" in allowed_dirs:
-                mask |= is_unknown
+            if direct_match:
+                mask = s.isin(allowed_dirs)
+            else:
+                def _map_dir(v):
+                    if pd.isna(v):
+                        return None
+                    try:
+                        fv = float(v)
+                        if fv > 0:
+                            return "Compra"
+                        if fv < 0:
+                            return "Venta"
+                        return "No definida"
+                    except Exception:
+                        pass
+                    t = str(v).strip().lower()
+                    if t in ("1", "long", "buy", "largo", "compra"):
+                        return "Compra"
+                    if t in ("-1", "short", "sell", "corto", "venta"):
+                        return "Venta"
+                    if ("long" in t) or ("buy" in t) or ("compra" in t) or ("largo" in t):
+                        return "Compra"
+                    if ("short" in t) or ("sell" in t) or ("venta" in t) or ("corto" in t):
+                        return "Venta"
+                    return "No definida"
+
+                dir_lbl = s.map(_map_dir)
+                mask = dir_lbl.isin(allowed_dirs)
 
             if include_missing:
-                mask |= raw.isna()
+                d = d[mask | s.isna()]
+            else:
+                d = d[mask]
 
-            d = d[mask].copy()
         # Horas (entrada) — usa entry_hour si existe; si no, intenta derivar de entry_ts
         hour_col = _infer_col(d, ["entry_hour", "hour", "entryHour"])
         if hour_col is None:
@@ -2553,12 +2576,10 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                 d["_tmp_entry_hour"] = pd.to_datetime(d[ts_col], errors="coerce").dt.hour
                 hour_col = "_tmp_entry_hour"
         if hour_col is not None:
-            # labels -> horas int
             sel_labels = params.get("lab_hours_allowed", None)
             if sel_labels:
-                # construir mapa label->hour para horas presentes
                 hours_present = sorted([int(h) for h in pd.Series(d[hour_col]).dropna().unique().tolist() if str(h).isdigit()])
-                label_map = { _hour_block_label(int(h)) : int(h) for h in hours_present }
+                label_map = {_hour_block_label(int(h)): int(h) for h in hours_present}
                 sel_hours = [label_map.get(x) for x in sel_labels if x in label_map]
                 sel_hours = [h for h in sel_hours if h is not None]
                 if sel_hours:
@@ -2570,7 +2591,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         # Rango OR
         or_col = _infer_col(d, ["orSize", "or_size", "or", "orPoints"])
         or_rng = params.get("lab_or_rng", None)
-        if or_col is not None and or_rng and len(or_rng)==2:
+        if or_col is not None and or_rng and len(or_rng) == 2:
             lo, hi = or_rng
             x = pd.to_numeric(d[or_col], errors="coerce")
             if include_missing:
@@ -2581,7 +2602,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         # Rango ATR
         atr_col = _infer_col(d, ["atr", "ATR", "atrPoints"])
         atr_rng = params.get("lab_atr_rng", None)
-        if atr_col is not None and atr_rng and len(atr_rng)==2:
+        if atr_col is not None and atr_rng and len(atr_rng) == 2:
             lo, hi = atr_rng
             x = pd.to_numeric(d[atr_col], errors="coerce")
             if include_missing:
@@ -2596,7 +2617,6 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             else:
                 d = d[d["support_flag"] != "Sin datos"]
 
-        # limpieza tmp
         if "_tmp_entry_hour" in d.columns:
             d.drop(columns=["_tmp_entry_hour"], inplace=True)
 
@@ -2926,6 +2946,19 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         # Dirección: por defecto Turbo NO debe filtrar por dirección (evita defaults Compra/Venta).
         # Si el Lab tiene un selector de direcciones, lo respetamos; si no, dejamos None.
         turbo_dirs_allowed = st.session_state.get("lab_dirs_allowed", None)
+        if isinstance(turbo_dirs_allowed, (list, tuple, set)):
+            _s = set(list(turbo_dirs_allowed))
+            if _s == {"Compra", "Venta", "No definida"}:
+                dir_col_chk = _infer_col(df_real, ["dir_label", "dir", "direction", "tradeDirection"])
+                if dir_col_chk is None:
+                    turbo_dirs_allowed = None
+                else:
+                    try:
+                        vals = set(df_real[dir_col_chk].dropna().astype(str).unique().tolist())
+                        if not vals.intersection(_s):
+                            turbo_dirs_allowed = None
+                    except Exception:
+                        turbo_dirs_allowed = None
 
         current_params = {
             "lab_include_missing": True,
@@ -2942,21 +2975,6 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             "lab_max_consec_losses": st.session_state.get("lab_max_consec_losses", 0),
         }
         cur_m = _turbo_metrics(df_real, current_params) or {"pnl": 0.0, "dd": float("inf"), "pf": float("nan"), "trades": 0}
-        # Si cambias filtros/reglas del Lab, invalida la caché de Turbo (evita deltas inconsistentes)
-        def _turbo_params_sig(p):
-            try:
-                import json as _json
-                return _json.dumps(p, sort_keys=True, default=str)
-            except Exception:
-                return str(p)
-
-        _cur_sig = _turbo_params_sig(current_params)
-        if st.session_state.get("turbo_cur_sig") != _cur_sig:
-            st.session_state["turbo_cur_sig"] = _cur_sig
-            st.session_state.pop("turbo_ranked_df", None)
-            st.session_state.pop("turbo_rank_label", None)
-            st.session_state.pop("turbo_rank_icon", None)
-
 
         colA, colB, colC = st.columns([1.1, 1.0, 1.9])
         with colA:
@@ -3051,18 +3069,12 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                         st.warning("Turbo no encontró presets válidos con la muestra mínima. Baja 'Mín trades' o revisa columnas OR/ATR/hora.")
                     else:
                         df_rows = pd.DataFrame(rows)
-
-                        # Diagnóstico rápido: si no hay bins/horas, muchos presets terminan siendo equivalentes
-                        if (len(hour_sets) <= 1) and (not or_bins) and (not atr_bins):
-                            st.info("Turbo no detectó variación suficiente en **horas/OR/ATR** (o no existen esas columnas). "
-                                    "En este caso, Turbo solo puede variar reglas diarias y es normal ver pocos presets distintos.")
-
-                        df_rows["_psig"] = df_rows["params"].apply(_turbo_params_sig)
-
-                        base_pnl = float(cur_m.get("pnl", 0.0))
-                        base_dd  = float(cur_m.get("dd", float("inf")))
-                        df_rows["d_pnl"] = df_rows["pnl"] - base_pnl
-                        df_rows["d_dd"]  = base_dd - df_rows["dd"]
+                        df_rows["_k"] = (
+                            df_rows["pnl"].round(2).astype(str) + "|" +
+                            df_rows["dd"].round(2).astype(str) + "|" +
+                            df_rows["pf"].round(2).astype(str) + "|" +
+                            df_rows["trades"].astype(str)
+                        )
 
                         obj = st.session_state.get("turbo_obj", "🚀 Rocket (máximo PnL)")
                         if obj.startswith("🚀"):
@@ -3081,19 +3093,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                             icon = "🎛️"
                             label = "Balance"
 
-                        # Selección diversa: evita colapsar a 1 solo preset cuando las métricas se repiten
-                        picked = []
-                        seen = set()
-                        for _, r in df_rank.iterrows():
-                            sig = r["_psig"]
-                            if sig in seen:
-                                continue
-                            seen.add(sig)
-                            picked.append(r)
-                            if len(picked) >= 10:
-                                break
-                        df_rank = pd.DataFrame(picked).reset_index(drop=True)
-
+                        df_rank = df_rank.drop_duplicates("_k", keep="first").head(10).reset_index(drop=True)
                         st.session_state["turbo_ranked_df"] = df_rank
                         st.session_state["turbo_rank_label"] = label
                         st.session_state["turbo_rank_icon"] = icon
@@ -3103,25 +3103,9 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             icon = st.session_state.get("turbo_rank_icon", "🚀")
             label = st.session_state.get("turbo_rank_label", "Opción")
 
-            def _rules_hint(p: dict) -> str:
-                mt = int(p.get("lab_max_trades", 0) or 0)
-                ml = float(p.get("lab_max_loss", 0.0) or 0.0)
-                mc = int(p.get("lab_max_consec_losses", 0) or 0)
-                parts = []
-                if mt:
-                    parts.append(f"máx {mt}/día")
-                if ml:
-                    parts.append(f"pérdida {ml:,.0f}/día")
-                if mc:
-                    parts.append(f"racha {mc}")
-                return "sin límite" if not parts else ", ".join(parts)
-
             def _opt_label(i, row):
-                pnl = float(row["pnl"]); dd = float(row["dd"]); pf = float(row["pf"]); tr = int(row["trades"])
-                # Delta siempre contra el estado actual (cur_m) para evitar inconsistencias visuales
-                d_pnl = pnl - float(cur_m.get("pnl", 0.0))
-                d_dd  = float(cur_m.get("dd", float("inf"))) - dd
-
+                pnl = float(row["pnl"]); dd=float(row["dd"]); pf=float(row["pf"]); tr=int(row["trades"])
+                d_pnl = float(row["d_pnl"]); d_dd=float(row["d_dd"])
                 if icon == "🚀":
                     delta = f"ΔPnL {_fmt_money(d_pnl)}"
                 elif icon == "🛟":
@@ -3129,9 +3113,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                     delta = f"ΔDD {sign}{d_dd:,.0f}"
                 else:
                     delta = f"Score {row['_score']:.3f}"
-
-                hint = _rules_hint(row.get("params", {}))
-                return f"{icon} {label} #{i+1} · {delta} · PnL {_fmt_money(pnl)} · DD {_fmt_dd(dd)} · PF {_fmt_pf(pf)} · Trades {tr} · Reglas: {hint}"
+                return f"{icon} {label} #{i+1} · {delta} · PnL {_fmt_money(pnl)} · DD {_fmt_dd(dd)} · PF {_fmt_pf(pf)} · Trades {tr}"
 
             options = [ _opt_label(i, ranked_df.iloc[i]) for i in range(len(ranked_df)) ]
             sel = st.selectbox("✅ Elige un preset (Turbo recomienda según tu objetivo):", options, index=0, key="turbo_sel")
