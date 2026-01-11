@@ -3009,22 +3009,66 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             else:
                 topn = dfset.head(10).copy()
 
-                # ---- Preparar métricas vs BASE ----
-                topn["dpnl"] = topn["pnl"].astype(float) - base_pnl
-                topn["dd_improve"] = base_dd - topn["dd"].astype(float)
+                                # ---- Selector (humano) + resumen claro ----
+                # Nota: NO mostramos 'Base (sin filtros)' ni deltas vs base; solo valores directos y reglas/filtros en lenguaje natural.
 
-                # ---- Selector simple (humano) ----
-                def _opt_label(i, r):
+                def _fmt_rng(rng):
+                    if not rng:
+                        return "sin filtro"
                     try:
-                        return (
-                            f"{i+1}. {str(r['name'])}  | "
-                            f"PnL {float(r['pnl']):,.0f} | "
-                            f"DD {float(r['dd']):,.0f} | "
-                            f"PF {float(r['pf']):.2f} | "
-                            f"Trades {int(r['trades'])}"
-                        )
+                        return f"{float(rng[0]):.2f}–{float(rng[1]):.2f}"
                     except Exception:
-                        return f"{i+1}. {str(r.get('name','Preset'))}"
+                        return "rango"
+
+                def _fmt_limit(v, kind="num"):
+                    try:
+                        v = float(v)
+                    except Exception:
+                        return "sin límite"
+                    if v == 0:
+                        return "sin límite"
+                    if kind == "money":
+                        return f"≤ {v:,.0f}"
+                    return f"≤ {int(v)}"
+
+                def _friendly_details(params):
+                    # Horario
+                    if params.get("lab_use_hours_filter") and params.get("lab_hours_allowed"):
+                        hh = params.get("lab_hours_allowed") or []
+                        hours = ", ".join(hh[:6])
+                        if len(hh) > 6:
+                            hours += "…"
+                        horario = f"Solo horas: {hours}"
+                    else:
+                        horario = "Todo el día"
+
+                    # Filtros
+                    or_txt  = _fmt_rng(params.get("lab_or_rng")) if params.get("lab_use_or_filter") else "sin filtro"
+                    atr_txt = _fmt_rng(params.get("lab_atr_rng")) if params.get("lab_use_atr_filter") else "sin filtro"
+
+                    # Reglas diarias
+                    mt = int(params.get("lab_max_trades", 0) or 0)
+                    ml = float(params.get("lab_max_loss", 0.0) or 0.0)
+                    mc = int(params.get("lab_max_consec_losses", 0) or 0)
+
+                    reglas = {
+                        "Máx trades/día": ("sin límite" if mt == 0 else str(mt)),
+                        "Máx pérdida/día": ("sin límite" if ml == 0 else f"{ml:,.0f}"),
+                        "Máx pérdidas seguidas": ("sin límite" if mc == 0 else str(mc)),
+                    }
+                    filtros = {"Horario": horario, "OR": or_txt, "ATR": atr_txt}
+                    return filtros, reglas
+
+                def _opt_label(i, r):
+                    emoji = "🚀" if bucket_key == "rocket" else ("🛟" if bucket_key == "sub" else "🎛️")
+                    nick  = "Cohete" if bucket_key == "rocket" else ("Submarino" if bucket_key == "sub" else "Balance")
+                    return (
+                        f"{emoji} {nick} #{i+1} · "
+                        f"PnL {float(r['pnl']):,.0f} · "
+                        f"DD {float(r['dd']):,.0f} · "
+                        f"PF {float(r['pf']):.2f} · "
+                        f"Trades {int(r['trades'])}"
+                    )
 
                 opt_labels = [_opt_label(i, row) for i, row in topn.reset_index(drop=True).iterrows()]
                 chosen_label = st.selectbox(
@@ -3037,24 +3081,38 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                 sel = topn.reset_index(drop=True).iloc[int(chosen_idx)]
                 sel_params = sel.get("params", {}) or {}
 
-                # ---- KPIs claros ----
+                # ---- KPIs claros (sin deltas) ----
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("PnL esperado", f"{float(sel['pnl']):,.0f}", delta=f"{float(sel['dpnl']):,.0f}")
-                m2.metric("MaxDD esperado", f"{float(sel['dd']):,.0f}", delta=f"{float(sel['dd_improve']):,.0f}")
-                m3.metric("Trades", f"{int(sel['trades'])}", delta=f"{int(sel['trades'])-base_trades}")
+                m1.metric("PnL esperado", f"{float(sel['pnl']):,.0f}")
+                m2.metric("MaxDD esperado", f"{float(sel['dd']):,.0f}")
+                m3.metric("Trades", f"{int(sel['trades'])}")
                 m4.metric("PF", f"{float(sel['pf']):.2f}")
 
-                # ---- Mensaje divertido + explicación humana ----
+                # ---- Mensaje divertido (sin hablar de 'base') ----
                 if bucket_key == "rocket":
-                    st.success(f"🚀 Cohete listo: ΔPnL **{float(sel['dpnl']):,.0f}** vs referencia. Mantén ojo en el DD.")
+                    st.success("🚀 Objetivo Cohete: prioriza **PnL**. Si el DD te asusta, cambia a 🛟 Submarino o 🎛️ Balance.")
                 elif bucket_key == "sub":
-                    st.info(f"🛟 Submarino seguro: mejora DD **{float(sel['dd_improve']):,.0f}** vs referencia. PnL más conservador.")
+                    st.info("🛟 Objetivo Submarino: prioriza **DD bajo**. Si quieres más potencia, prueba 🚀 Cohete o 🎛️ Balance.")
                 else:
-                    st.success(f"🎛️ Tuned: balance decente. ΔPnL **{float(sel['dpnl']):,.0f}** y mejora DD **{float(sel['dd_improve']):,.0f}**.")
+                    st.success("🎛️ Objetivo Balance: busca la mejor relación **PnL/DD** sin extremos.")
 
-                st.caption("📌 Reglas/Filtros aplicados: " + _preset_summary(sel_params))
-
-
+                # ---- Resumen humano del preset seleccionado ----
+                filtros_h, reglas_h = _friendly_details(sel_params)
+                cL, cR = st.columns([1, 1])
+                with cL:
+                    st.markdown(
+                        "**Filtros**\n"
+                        f"- 🕒 Horario: {filtros_h['Horario']}\n"
+                        f"- 📦 OR: {filtros_h['OR']}\n"
+                        f"- 📏 ATR: {filtros_h['ATR']}"
+                    )
+                with cR:
+                    st.markdown(
+                        "**Reglas diarias**\n"
+                        f"- 🔢 Máx trades/día: {reglas_h['Máx trades/día']}\n"
+                        f"- 🧯 Máx pérdida/día: {reglas_h['Máx pérdida/día']}\n"
+                        f"- 😵 Máx pérdidas seguidas: {reglas_h['Máx pérdidas seguidas']}"
+                    )
                 if st.button("🎛️ Aplicar este preset", key="turbo_apply_selected"):
                     _apply_preset(sel_params)
                     st.success("Preset aplicado. Recalculo el Lab con esos valores…")
