@@ -4,7 +4,7 @@ import numpy as np
 import json
 import plotly.express as px
 
-# Avoid NameError in optional analytics sections; will be overwritten when simulation produces it
+# Avoid NameError in optional analytics sections; will be overwritten when simulation produces it 
 stops_df = pd.DataFrame()
 
 
