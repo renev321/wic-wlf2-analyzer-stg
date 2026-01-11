@@ -2828,9 +2828,12 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
 
     def _rank_presets(df, presets, min_trades=30):
-        # BASE: sin filtros ni reglas (referencia)
-        base = _make_preset("Base (sin filtros)")
-        base_m = _turbo_metrics(df, base["params"]) or {"pnl": 0.0, "dd": float("inf"), "trades": 0, "pf": float("nan")}
+        """Rankea presets (SIN incluir 'Base' como opción visible).
+        Aun así calcula una referencia interna (base_m) sobre el universo actual para deltas y para evitar sugerencias peores.
+        """
+        # Referencia interna: universo actual sin filtros ni reglas (solo para comparar)
+        base_params = _make_preset("_BASE_INTERNAL_")["params"]
+        base_m = _turbo_metrics(df, base_params) or {"pnl": 0.0, "dd": float("inf"), "trades": 0, "pf": float("nan")}
 
         def _row_from(name, params, m):
             pnl = float(m.get("pnl", 0.0))
@@ -2840,8 +2843,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             bal = (pnl / dd) if (dd and dd != 0 and dd != float("inf")) else (pnl if dd == 0 else 0.0)
             return {"name": name, "params": params, "trades": trades, "pnl": pnl, "dd": dd, "pf": pf, "bal": bal}
 
-        rows = [_row_from(base["name"], base["params"], base_m)]
-
+        rows = []
         for pr in (presets or []):
             m = _turbo_metrics(df, pr["params"])
             if not m:
@@ -2852,15 +2854,13 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         if df_rows.empty:
             return None
 
-        # Anti-ruido: exige min_trades, pero BASE siempre queda habilitado
+        # Anti-ruido: exige min_trades
         df_rows["ok"] = df_rows["trades"] >= int(min_trades)
-        df_rows.loc[df_rows["name"].astype(str).str.contains("Base", case=False, na=False), "ok"] = True
-
         df_ok = df_rows[df_rows["ok"]].copy() if df_rows["ok"].any() else df_rows.copy()
 
         base_pnl_val = float(base_m.get("pnl", 0.0) or 0.0)
 
-        # Rocket/Tuned: evita sugerir algo peor que BASE si hay opciones mejores
+        # Rocket/Tuned: evita sugerir algo con PnL peor que la referencia si hay opciones iguales/mejores
         df_for_rocket = df_ok
         df_pos = df_ok[df_ok["pnl"] >= base_pnl_val]
         if not df_pos.empty:
@@ -2995,11 +2995,6 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             base_trades = int(base.get("trades") or 0)
             base_pf     = float(base.get("pf") or 0.0)
 
-            st.markdown(
-                f"**Base (referencia, sin filtros):** "
-                f"PnL `{base_pnl:,.0f}` | MaxDD `{base_dd:,.0f}` | Trades `{base_trades}` | PF `{base_pf:.2f}`"
-            )
-
             bucket_label = st.radio(
                 "🎯 Elige tu objetivo (solo 1):",
                 ["🚀 Rocket (máximo PnL)", "🛟 Submarine (mínimo DD)", "🎛️ Tuned (balance)"],
@@ -3033,7 +3028,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
                 opt_labels = [_opt_label(i, row) for i, row in topn.reset_index(drop=True).iterrows()]
                 chosen_label = st.selectbox(
-                    "✅ Elige un preset recomendado:",
+                    "✅ Elige un preset (Turbo recomienda según tu objetivo):",
                     opt_labels,
                     index=0,
                     key="turbo_selected_label",
@@ -3051,38 +3046,14 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
                 # ---- Mensaje divertido + explicación humana ----
                 if bucket_key == "rocket":
-                    st.success(f"🚀 Cohete listo: ΔPnL **{float(sel['dpnl']):,.0f}** vs Base. Mantén ojo en el DD.")
+                    st.success(f"🚀 Cohete listo: ΔPnL **{float(sel['dpnl']):,.0f}** vs referencia. Mantén ojo en el DD.")
                 elif bucket_key == "sub":
-                    st.info(f"🛟 Submarino seguro: mejora DD **{float(sel['dd_improve']):,.0f}** vs Base. PnL más conservador.")
+                    st.info(f"🛟 Submarino seguro: mejora DD **{float(sel['dd_improve']):,.0f}** vs referencia. PnL más conservador.")
                 else:
                     st.success(f"🎛️ Tuned: balance decente. ΔPnL **{float(sel['dpnl']):,.0f}** y mejora DD **{float(sel['dd_improve']):,.0f}**.")
 
                 st.caption("📌 Reglas/Filtros aplicados: " + _preset_summary(sel_params))
 
-                # ---- Detalle técnico opcional (para power users) ----
-                with st.expander("🔍 Ver detalles técnicos (tabla)", expanded=False):
-                    def _fmt0(x):
-                        try:
-                            return f"{float(x):,.0f}"
-                        except Exception:
-                            return "0"
-
-                    view_df = pd.DataFrame({
-                        "Preset": topn["name"].astype(str),
-                        "PnL esperado": topn["pnl"].map(_fmt0),
-                        "ΔPnL": topn["dpnl"].map(_fmt0),
-                        "DD esperado": topn["dd"].map(_fmt0),
-                        "Mejora DD": topn["dd_improve"].map(_fmt0),
-                        "Trades": topn["trades"].astype(int),
-                        "PF": topn["pf"].astype(float).round(2),
-                    })
-                    if "bal" in topn.columns:
-                        view_df["Score"] = topn["bal"].astype(float).round(2)
-
-                    try:
-                        st.dataframe(view_df, use_container_width=True, hide_index=True)
-                    except TypeError:
-                        st.dataframe(view_df, use_container_width=True)
 
                 if st.button("🎛️ Aplicar este preset", key="turbo_apply_selected"):
                     _apply_preset(sel_params)
