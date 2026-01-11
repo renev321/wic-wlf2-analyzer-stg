@@ -2520,16 +2520,32 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
         include_missing = bool(params.get("lab_include_missing", True))
 
-        # Dirección
-        dir_col = _infer_col(d, ["dir_label", "dir", "direction", "tradeDirection"])
-        allowed_dirs = params.get("lab_dirs_allowed", ["Compra", "Venta", "No definida"])
-        if dir_col is not None and allowed_dirs:
-            if include_missing:
-                d = d[d[dir_col].isin(allowed_dirs) | d[dir_col].isna()]
-            else:
-                d = d[d[dir_col].isin(allowed_dirs)]
+# Dirección
+dir_col = _infer_col(d, ["dir_label", "dir", "direction", "tradeDirection"])
+allowed_dirs = params.get("lab_dirs_allowed", ["Compra", "Venta", "No definida"])
+if dir_col is not None and allowed_dirs:
+    raw = d[dir_col]
+    dnum = pd.to_numeric(raw, errors="coerce")
+    raw_str = raw.astype(str).str.lower()
 
-        # Horas (entrada) — usa entry_hour si existe; si no, intenta derivar de entry_ts
+    # Soporta logs con dir numérico (1/-1), o texto ("Long/Short"), o variantes ("buy/sell", "compra/venta")
+    is_long = (dnum > 0) | (dnum.isna() & raw_str.str.contains(r"long|buy|compra|largo", regex=True))
+    is_short = (dnum < 0) | (dnum.isna() & raw_str.str.contains(r"short|sell|venta|corto", regex=True))
+    is_unknown = (~(is_long | is_short)) | (dnum == 0)
+
+    mask = pd.Series(False, index=d.index)
+    if "Compra" in allowed_dirs:
+        mask |= is_long
+    if "Venta" in allowed_dirs:
+        mask |= is_short
+    if "No definida" in allowed_dirs:
+        mask |= is_unknown
+
+    if include_missing:
+        mask |= raw.isna()
+
+    d = d[mask].copy()
+# Horas (entrada) — usa entry_hour si existe; si no, intenta derivar de entry_ts
         hour_col = _infer_col(d, ["entry_hour", "hour", "entryHour"])
         if hour_col is None:
             ts_col = _infer_col(d, ["entry_ts", "entryTime", "entry_time", "ts_entry"])
