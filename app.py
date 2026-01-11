@@ -2679,7 +2679,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         hour_col = _infer_col(df, ["entry_hour","hour","Hour","trade_hour","entryHour"])
         atr_col = _infer_col(df, ["atr","ATR","atr_points","atrPts","atr_pt"])
         or_col  = _infer_col(df, ["or_range","OR","opening_range","orPts","or_points"])
-        ts_col  = _infer_col(df, ["exit_ts","exit_time","ts","time","datetime","Timestamp","timestamp"])
+        ts_col  = _infer_col(df, ["exit_ts","exit_time","exitTime","entry_ts","entry_time","entryTime","ts","time","datetime","Timestamp","timestamp"])
         return pnl_col, dd_col, hour_col, atr_col, or_col, ts_col
 
     def _turbo_drawdown(df, pnl_col, ts_col=None):
@@ -2701,25 +2701,64 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         dd = (peak - eq).max()
         return float(dd) if dd is not None else float("nan")
 
+    
     def _turbo_metrics(df, preset_params):
+        """Calcula métricas **ya simuladas** (filtros + reglas diarias) para que T/L/C afecte los resultados."""
         pnl_col, dd_col, hour_col, atr_col, or_col, ts_col = _turbo_get_cols(df)
         if not pnl_col:
             return None
+
+        # 1) aplicar filtros (horas / OR / ATR / dirección)
         df_f = _lab_filter_df_params(df, preset_params)
         if df_f is None or df_f.empty:
-            return {"trades":0,"pnl":0.0,"dd":float('inf'),"pf":float('nan'),"avg":float('nan')}
+            return {"trades": 0, "pnl": 0.0, "dd": float("inf"), "pf": float("nan"), "avg": float("nan")}
 
-        pnl_s = _turbo_safe_num(df_f[pnl_col]).fillna(0.0)
+        # 2) asegurar columna estándar que usa la simulación
+        df_work = df_f.copy()
+        if "tradeRealized" not in df_work.columns or pnl_col != "tradeRealized":
+            df_work["tradeRealized"] = _turbo_safe_num(df_work[pnl_col]).fillna(0.0)
+        else:
+            df_work["tradeRealized"] = _turbo_safe_num(df_work["tradeRealized"]).fillna(0.0)
+
+        # 3) simular reglas diarias (T/L/C + opcionales)
+        max_loss = float(preset_params.get("lab_max_loss", 0.0) or 0.0)
+        max_profit = float(preset_params.get("lab_max_profit", 0.0) or 0.0)
+        max_trades = int(preset_params.get("lab_max_trades", 0) or 0)
+        max_consec_losses = int(preset_params.get("lab_max_consec_losses", 0) or 0)
+        stop_big_loss = bool(preset_params.get("lab_stop_big_loss", False))
+        stop_big_win  = bool(preset_params.get("lab_stop_big_win", False))
+
+        df_sim, _stops = _simulate_daily_rules(
+            df_work,
+            max_loss=max_loss,
+            max_profit=max_profit,
+            max_trades=max_trades,
+            max_consec_losses=max_consec_losses,
+            stop_big_loss=stop_big_loss,
+            stop_big_win=stop_big_win,
+        )
+
+        if df_sim is None or df_sim.empty:
+            return {"trades": 0, "pnl": 0.0, "dd": float("inf"), "pf": float("nan"), "avg": float("nan")}
+
+        pnl_s = _turbo_safe_num(df_sim["tradeRealized"]).fillna(0.0)
         pnl = float(pnl_s.sum())
-        trades = int(len(df_f))
-        dd = _turbo_drawdown(df_f, pnl_col, ts_col)
+        trades = int(len(df_sim))
 
-        gp = float(pnl_s[pnl_s>0].sum())
-        gl = float((-pnl_s[pnl_s<0]).sum())
-        pf = (gp/gl) if gl > 0 else (float('inf') if gp>0 else float('nan'))
+        # DD por curva de equity (ordenada si hay timestamps)
+        ts_for_dd = None
+        for cand in ["exit_time", "entry_time", ts_col]:
+            if cand and cand in df_sim.columns:
+                ts_for_dd = cand
+                break
+        dd = _turbo_drawdown(df_sim, "tradeRealized", ts_for_dd)
 
-        avg = pnl / trades if trades>0 else float('nan')
-        return {"trades":trades,"pnl":pnl,"dd":dd,"pf":pf,"avg":avg}
+        gp = float(pnl_s[pnl_s > 0].sum())
+        gl = float((-pnl_s[pnl_s < 0]).sum())
+        pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else float("nan"))
+
+        avg = pnl / trades if trades > 0 else float("nan")
+        return {"trades": trades, "pnl": pnl, "dd": dd, "pf": pf, "avg": avg}
 
     def _top_bins(series, pnl_series, bins, top_k=2):
         try:
@@ -2787,12 +2826,11 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
         return {"name": name, "params": params}
 
+
     def _rank_presets(df, presets, min_trades=30):
-        # Always include the BASE (no filters) so "Rocket" can never be worse than doing nothing.
+        # BASE: sin filtros ni reglas (referencia)
         base = _make_preset("Base (sin filtros)")
         base_m = _turbo_metrics(df, base["params"]) or {"pnl": 0.0, "dd": float("inf"), "trades": 0, "pf": float("nan")}
-
-        rows = []
 
         def _row_from(name, params, m):
             pnl = float(m.get("pnl", 0.0))
@@ -2800,20 +2838,10 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             trades = int(m.get("trades", 0))
             pf = m.get("pf", float("nan"))
             bal = (pnl / dd) if (dd and dd != 0 and dd != float("inf")) else (pnl if dd == 0 else 0.0)
-            return {
-                "name": name,
-                "params": params,
-                "trades": trades,
-                "pnl": pnl,
-                "dd": dd,
-                "pf": pf,
-                "bal": bal,
-            }
+            return {"name": name, "params": params, "trades": trades, "pnl": pnl, "dd": dd, "pf": pf, "bal": bal}
 
-        # BASE row
-        rows.append(_row_from(base["name"], base["params"], base_m))
+        rows = [_row_from(base["name"], base["params"], base_m)]
 
-        # Candidate presets
         for pr in (presets or []):
             m = _turbo_metrics(df, pr["params"])
             if not m:
@@ -2821,46 +2849,30 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             rows.append(_row_from(pr["name"], pr["params"], m))
 
         df_rows = pd.DataFrame(rows)
-        # Ensure BASE is always selectable (no filters)
-        try:
-            base_row = {
-                'name': 'BASE (sin filtros)',
-                'params': base_preset,
-                'trades': int(base.get('trades', 0) or 0),
-                'pnl': float(base.get('pnl', 0.0) or 0.0),
-                'dd': float(base.get('dd', 0.0) or 0.0),
-                'pf': float(base.get('pf', np.nan)),
-                'bal': float(base.get('bal', 0.0) or 0.0),
-                'ok': True,
-            }
-            df_rows = pd.concat([pd.DataFrame([base_row]), df_rows], ignore_index=True)
-        except Exception:
-            pass
         if df_rows.empty:
             return None
 
+        # Anti-ruido: exige min_trades, pero BASE siempre queda habilitado
         df_rows["ok"] = df_rows["trades"] >= int(min_trades)
-        df_ok = df_rows[df_rows["ok"]].copy() if (df_rows["ok"].any()) else df_rows.copy()
+        df_rows.loc[df_rows["name"].astype(str).str.contains("Base", case=False, na=False), "ok"] = True
 
-        # Rankings
+        df_ok = df_rows[df_rows["ok"]].copy() if df_rows["ok"].any() else df_rows.copy()
+
+        base_pnl_val = float(base_m.get("pnl", 0.0) or 0.0)
+
+        # Rocket/Tuned: evita sugerir algo peor que BASE si hay opciones mejores
         df_for_rocket = df_ok
-        try:
-            base_pnl_val = float(base.get('pnl', 0.0) or 0.0)
-            df_pos = df_ok[df_ok['pnl'] >= base_pnl_val]
-            if not df_pos.empty:
-                df_for_rocket = df_pos
-        except Exception:
-            pass
+        df_pos = df_ok[df_ok["pnl"] >= base_pnl_val]
+        if not df_pos.empty:
+            df_for_rocket = df_pos
+
+        df_for_tuned = df_ok
+        df_pos2 = df_ok[df_ok["pnl"] >= base_pnl_val]
+        if not df_pos2.empty:
+            df_for_tuned = df_pos2
+
         rocket = df_for_rocket.sort_values(["pnl", "dd", "trades", "pf"], ascending=[False, True, False, False]).head(10)
         sub    = df_ok.sort_values(["dd", "pnl", "trades"], ascending=[True, False, False]).head(10)
-        df_for_tuned = df_ok
-        try:
-            base_pnl_val = float(base.get('pnl', 0.0) or 0.0)
-            df_pos = df_ok[df_ok['pnl'] >= base_pnl_val]
-            if not df_pos.empty:
-                df_for_tuned = df_pos
-        except Exception:
-            pass
         tuned  = df_for_tuned.sort_values(["bal", "pnl", "dd", "trades"], ascending=[False, False, True, False]).head(10)
 
         return {"base": base_m, "all": df_rows, "rocket": rocket, "sub": sub, "tuned": tuned}
@@ -2874,15 +2886,38 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
     if df_real is None or df_real.empty:
         st.info("Turbo necesita datos cargados (trades) para proponer presets.")
     else:
-        mode = st.radio("Modo", ["Modo A (rápido)", "Modo B (lab completo)"], horizontal=True, key="turbo_mode")
 
-        colA, colB, colC = st.columns([1,1,2])
+        st.caption(f"Universo Turbo: **{len(df_real)}** trades (según la carga/selección actual).")
+
+        colA, colB, colC = st.columns([1, 1, 2])
         with colA:
-            min_trades = st.number_input("Mín trades (anti-ruido)", min_value=5, max_value=500, value=30, step=5, key="turbo_min_trades")
+            min_mode = st.selectbox(
+                "Mín trades (anti-ruido)",
+                ["Absoluto", "% del dataset"],
+                index=0,
+                key="turbo_min_mode",
+                help="Sirve para evitar que Turbo recomiende presets con muy poca muestra."
+            )
+            if min_mode == "% del dataset":
+                pct = st.slider("Porcentaje mínimo", min_value=1, max_value=100, value=10, step=1, key="turbo_min_pct")
+                min_trades = max(5, int(round(len(df_real) * (pct / 100.0))))
+                st.caption(f"→ mínimo calculado: **{min_trades}** trades")
+            else:
+                min_trades = st.number_input(
+                    "Mínimo absoluto",
+                    min_value=5, max_value=500, value=30, step=5,
+                    key="turbo_min_trades"
+                )
         with colB:
-            top_bins = st.number_input("Top bins", min_value=1, max_value=5, value=2, step=1, key="turbo_top_bins")
+            top_bins = st.number_input(
+                "Top rangos (OR/ATR)",
+                min_value=1, max_value=5, value=2, step=1,
+                key="turbo_top_bins",
+                help="Cuántos rangos OR/ATR (intervalos) intentará probar Turbo (más = más combinaciones)."
+            )
         with colC:
-            st.caption("Tip: sube **Mín trades** si ves presets muy agresivos o con PnL raro.")
+            st.caption("Tip: sube **Mín trades** si ves presets muy agresivos o con PnL raro. "
+                       "‘Top rangos’ controla cuántos intervalos OR/ATR se testean.")
 
         go = st.button("🧪 Generar presets", key="turbo_go")
         if go:
@@ -2915,22 +2950,16 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                         if len(qs) >= 3:
                             bins = sorted(set(qs))
                             atr_bins = _top_bins(x, pnl_s, bins=bins, top_k=int(top_bins))
-
-                    # Discrete risk/rules knobs
-                    if mode.startswith("Modo A"):
-                        max_trades_opts = [0, 3]
-                        max_loss_opts = [0, 600]
-                        max_consec_opts = [0, 3]
-                    else:
-                        max_trades_opts = [0, 2, 3, 4]
-                        max_loss_opts = [0, 400, 600, 800]
-                        max_consec_opts = [0, 2, 3]
+                    # Reglas (siempre "Lab completo"): T (max trades/día) / L (max pérdida/día) / C (max pérdidas seguidas)
+                    max_trades_opts = [0, 2, 3, 4]
+                    max_loss_opts = [0, 400, 600, 800]
+                    max_consec_opts = [0, 2, 3]
 
                     or_opts = [None] + or_bins
                     atr_opts = [None] + atr_bins
 
                     # Build combos (cap)
-                    cap = 200 if mode.startswith("Modo A") else 800
+                    cap = 800
                     for hs_name, hs in hour_sets:
                         for or_rng in or_opts:
                             for atr_rng in atr_opts:
@@ -2985,87 +3014,81 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             else:
                 topn = dfset.head(10).copy()
 
-                # ---- Tabla simple (solo info útil) ----
+                # ---- Preparar métricas vs BASE ----
                 topn["dpnl"] = topn["pnl"].astype(float) - base_pnl
-                topn["ddd"]  = topn["dd"].astype(float)  - base_dd
                 topn["dd_improve"] = base_dd - topn["dd"].astype(float)
 
-                def _fmt0(x):
+                # ---- Selector simple (humano) ----
+                def _opt_label(i, r):
                     try:
-                        return f"{float(x):,.0f}"
+                        return (
+                            f"{i+1}. {str(r['name'])}  | "
+                            f"PnL {float(r['pnl']):,.0f} | "
+                            f"DD {float(r['dd']):,.0f} | "
+                            f"PF {float(r['pf']):.2f} | "
+                            f"Trades {int(r['trades'])}"
+                        )
                     except Exception:
-                        return "0"
+                        return f"{i+1}. {str(r.get('name','Preset'))}"
 
-                view_df = pd.DataFrame({
-                    "Preset": topn["name"].astype(str),
-                    "PnL esperado": topn["pnl"].map(_fmt0),
-                    "ΔPnL": topn["dpnl"].map(_fmt0),
-                    "DD esperado": topn["dd"].map(_fmt0),
-                    "Mejora DD": topn["dd_improve"].map(_fmt0),
-                    "Trades": topn["trades"].astype(int),
-                    "PF": topn["pf"].astype(float).round(2),
-                })
+                opt_labels = [_opt_label(i, row) for i, row in topn.reset_index(drop=True).iterrows()]
+                chosen_label = st.selectbox(
+                    "✅ Elige un preset recomendado:",
+                    opt_labels,
+                    index=0,
+                    key="turbo_selected_label",
+                )
+                chosen_idx = opt_labels.index(chosen_label) if chosen_label in opt_labels else 0
+                sel = topn.reset_index(drop=True).iloc[int(chosen_idx)]
+                sel_params = sel.get("params", {}) or {}
 
-                # Score balance (si existe)
-                if "bal" in topn.columns:
-                    view_df["Score"] = topn["bal"].astype(float).round(2)
+                # ---- KPIs claros ----
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("PnL esperado", f"{float(sel['pnl']):,.0f}", delta=f"{float(sel['dpnl']):,.0f}")
+                m2.metric("MaxDD esperado", f"{float(sel['dd']):,.0f}", delta=f"{float(sel['dd_improve']):,.0f}")
+                m3.metric("Trades", f"{int(sel['trades'])}", delta=f"{int(sel['trades'])-base_trades}")
+                m4.metric("PF", f"{float(sel['pf']):.2f}")
 
-                try:
-                    st.dataframe(view_df, use_container_width=True, hide_index=True)
-                except TypeError:
-                    st.dataframe(view_df, use_container_width=True)
+                # ---- Mensaje divertido + explicación humana ----
+                if bucket_key == "rocket":
+                    st.success(f"🚀 Cohete listo: ΔPnL **{float(sel['dpnl']):,.0f}** vs Base. Mantén ojo en el DD.")
+                elif bucket_key == "sub":
+                    st.info(f"🛟 Submarino seguro: mejora DD **{float(sel['dd_improve']):,.0f}** vs Base. PnL más conservador.")
+                else:
+                    st.success(f"🎛️ Tuned: balance decente. ΔPnL **{float(sel['dpnl']):,.0f}** y mejora DD **{float(sel['dd_improve']):,.0f}**.")
 
-                # ---- Selector por fila (radio) ----
-                options = list(topn["name"].astype(str).values)
-                if len(options) > 0:
-                    chosen = st.radio(
-                        "✅ Selecciona un preset para aplicar:",
-                        options,
-                        index=0,
-                        key="turbo_selected_name",
-                    )
-                    sel = topn.loc[topn["name"].astype(str) == str(chosen)].iloc[0]
-                    sel_params = sel.get("params", {}) or {}
+                st.caption("📌 Reglas/Filtros aplicados: " + _preset_summary(sel_params))
 
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("PnL esperado", f"{float(sel['pnl']):,.0f}", delta=f"{float(sel['pnl'])-base_pnl:,.0f}")
-                    m2.metric("MaxDD esperado", f"{float(sel['dd']):,.0f}", delta=f"{(base_dd-float(sel['dd'])):,.0f}")
-                    m3.metric("Trades", f"{int(sel['trades'])}", delta=f"{int(sel['trades'])-base_trades}")
-                    m4.metric("PF", f"{float(sel['pf']):.2f}")
+                # ---- Detalle técnico opcional (para power users) ----
+                with st.expander("🔍 Ver detalles técnicos (tabla)", expanded=False):
+                    def _fmt0(x):
+                        try:
+                            return f"{float(x):,.0f}"
+                        except Exception:
+                            return "0"
 
-                    def _short_params(p):
-                        parts = []
-                        if p.get("hours"):
-                            parts.append("Horas=" + ", ".join(map(str, p["hours"][:6])) + ("…" if len(p["hours"])>6 else ""))
-                        if p.get("or_rng") is not None:
-                            try:
-                                lo, hi = p["or_rng"]
-                                parts.append(f"OR={lo:.0f}..{hi:.0f}")
-                            except Exception:
-                                pass
-                        if p.get("atr_rng") is not None:
-                            try:
-                                lo, hi = p["atr_rng"]
-                                parts.append(f"ATR={lo:.0f}..{hi:.0f}")
-                            except Exception:
-                                pass
-                        if p.get("min_trades") is not None:
-                            parts.append(f"MinTrades={int(p['min_trades'])}")
-                        if p.get("max_trades_day") is not None:
-                            parts.append(f"MaxTrades/D={int(p['max_trades_day'])}")
-                        if p.get("max_loss_day") is not None:
-                            parts.append(f"MaxLoss/D={float(p['max_loss_day']):.0f}")
-                        if p.get("max_consec_losses") is not None:
-                            parts.append(f"MaxConsecLoss={int(p['max_consec_losses'])}")
-                        return " | ".join(parts) if parts else "—"
+                    view_df = pd.DataFrame({
+                        "Preset": topn["name"].astype(str),
+                        "PnL esperado": topn["pnl"].map(_fmt0),
+                        "ΔPnL": topn["dpnl"].map(_fmt0),
+                        "DD esperado": topn["dd"].map(_fmt0),
+                        "Mejora DD": topn["dd_improve"].map(_fmt0),
+                        "Trades": topn["trades"].astype(int),
+                        "PF": topn["pf"].astype(float).round(2),
+                    })
+                    if "bal" in topn.columns:
+                        view_df["Score"] = topn["bal"].astype(float).round(2)
 
-                    st.caption("🔎 Resumen (muy corto): " + _short_params(sel_params))
+                    try:
+                        st.dataframe(view_df, use_container_width=True, hide_index=True)
+                    except TypeError:
+                        st.dataframe(view_df, use_container_width=True)
 
-                    if st.button("🎛️ Aplicar este preset", key="turbo_apply_selected"):
-                        _apply_preset(sel_params)
-                        st.success("Preset aplicado. Recalculo el Lab con esos valores…")
+                if st.button("🎛️ Aplicar este preset", key="turbo_apply_selected"):
+                    _apply_preset(sel_params)
+                    st.success("Preset aplicado. Recalculo el Lab con esos valores…")
         else:
-            st.info("Pulsa **Iniciar** para que Turbo genere presets con tus datos.")
+            st.info("Pulsa **🧪 Generar presets** para que Turbo proponga recomendaciones con tus datos.")
 with lab_right:
 
     st.markdown("**Filtros (opcional)**")
