@@ -2825,8 +2825,13 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                 out.append((float(b.left), float(b.right)))
         return out
 
-    def _make_params(hours=None, or_rng=None, atr_rng=None, max_trades=0, max_loss=0, max_consec=0):
+    def _make_params(hours=None, or_rng=None, atr_rng=None, max_trades=0, max_loss=0, max_consec=0, dirs_allowed=None):
+        # Nota clave: si NO pasamos 'lab_dirs_allowed', _lab_filter_df_params usa defaults
+        # ("Compra/Venta/No definida") que suelen NO existir en datasets NT (LONG/SHORT/1/-1).
+        # Resultado: Turbo filtra casi todo y "no encuentra presets".
         return {
+            "lab_include_missing": True,
+            "lab_dirs_allowed": list(dirs_allowed) if dirs_allowed is not None else None,
             "lab_use_hours_filter": bool(hours),
             "lab_hours_allowed": _hours_to_labels(hours) if hours else [],
             "lab_use_or_filter": bool(or_rng),
@@ -2880,7 +2885,13 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         pnl_col, hour_col, atr_col, or_col, ts_col = _turbo_get_cols(df_real)
         st.caption(f"Universo Turbo: **{len(df_real)}** trades (según la carga/selección actual).")
 
+        # Dirección: por defecto Turbo NO debe filtrar por dirección (evita defaults Compra/Venta).
+        # Si el Lab tiene un selector de direcciones, lo respetamos; si no, dejamos None.
+        turbo_dirs_allowed = st.session_state.get("lab_dirs_allowed", None)
+
         current_params = {
+            "lab_include_missing": True,
+            "lab_dirs_allowed": turbo_dirs_allowed,
             "lab_use_hours_filter": st.session_state.get("lab_use_hours_filter", False),
             "lab_hours_allowed": st.session_state.get("lab_hours_allowed", []),
             "lab_use_or_filter": st.session_state.get("lab_use_or_filter", False),
@@ -2921,6 +2932,14 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                 f"**Estado actual** → PnL: `{_fmt_money(cur_m['pnl'])}` · DD: `{_fmt_dd(cur_m['dd'])}` · PF: `{_fmt_pf(cur_m['pf'])}` · Trades: `{cur_m['trades']}`"
             )
 
+        st.markdown("#### 🎯 Elige tu objetivo (solo 1):")
+        st.radio(
+            "",
+            ["🚀 Rocket (máximo PnL)", "🛟 Submarine (mínimo DD)", "🎛️ Tuned (balance)"],
+            horizontal=True,
+            key="turbo_obj",
+        )
+
         if st.button("🧪 Generar presets", key="turbo_generate_btn"):
             if not pnl_col:
                 st.error("Turbo no encuentra una columna de PnL (tradeRealized/pnl/etc).")
@@ -2946,7 +2965,7 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
                                 for mt in max_trades_opts:
                                     for ml in max_loss_opts:
                                         for mc in max_consec_opts:
-                                            params = _make_params(hours=hs, or_rng=or_rng, atr_rng=atr_rng, max_trades=mt, max_loss=ml, max_consec=mc)
+                                            params = _make_params(hours=hs, or_rng=or_rng, atr_rng=atr_rng, max_trades=mt, max_loss=ml, max_consec=mc, dirs_allowed=turbo_dirs_allowed)
                                             m = _turbo_metrics(df_real, params)
                                             if not m:
                                                 continue
