@@ -3068,20 +3068,46 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
     # Comparativa principal: REAL (historial) vs SIMULADO (filtros + reglas)
     # (bloque defensivo: evita NameError si cambian nombres de variables)
     # ------------------------------------------------------------
-    try:
-        real_df = base_for_lab
-    except Exception:
-        real_df = df_real if "df_real" in globals() else pd.DataFrame()
+    # ------------------------------------------------------------
+    # Comparativa principal: REAL (universo) vs CANDIDATO (tras filtros) vs SIM (tras reglas)
+    # Calculamos todo aquí para que la vista previa sea consistente con "Aplicar".
+    # ------------------------------------------------------------
+    real_df = df_real.copy() if (df_real is not None and not df_real.empty) else pd.DataFrame()
 
-    try:
-        cand_df = filtered
-    except Exception:
-        cand_df = real_df
+    params_now = {
+        "lab_use_hours_filter": st.session_state.get("lab_use_hours_filter", False),
+        "lab_hours_allowed": st.session_state.get("lab_hours_allowed", []),
+        "lab_use_or_filter": st.session_state.get("lab_use_or_filter", False),
+        "lab_or_rng": st.session_state.get("lab_or_rng", None),
+        "lab_use_atr_filter": st.session_state.get("lab_use_atr_filter", False),
+        "lab_atr_rng": st.session_state.get("lab_atr_rng", None),
+        "lab_use_rules": st.session_state.get("lab_use_rules", True),
+        "lab_max_trades": st.session_state.get("lab_max_trades", 0),
+        "lab_max_loss": st.session_state.get("lab_max_loss", 0.0),
+        "lab_max_profit": st.session_state.get("lab_max_profit", 0.0),
+        "lab_max_consec_losses": st.session_state.get("lab_max_consec_losses", 0),
+        "lab_stop_big_loss": st.session_state.get("lab_stop_big_loss", False),
+        "lab_stop_big_win": st.session_state.get("lab_stop_big_win", False),
+    }
 
-    try:
-        sim_df = sim_kept
-    except Exception:
-        sim_df = pd.DataFrame()
+    cand_df = _lab_filter_df_params(real_df, params_now) if (real_df is not None and not real_df.empty) else pd.DataFrame()
+    filtered = cand_df  # compat: usado en secciones "what-if" y "consejos"
+
+    if params_now.get("lab_use_rules", True):
+        sim_kept, stops_df = _simulate_daily_rules(
+            cand_df,
+            max_loss=float(params_now.get("lab_max_loss", 0.0) or 0.0),
+            max_profit=float(params_now.get("lab_max_profit", 0.0) or 0.0),
+            max_trades=int(params_now.get("lab_max_trades", 0) or 0),
+            max_consec_losses=int(params_now.get("lab_max_consec_losses", 0) or 0),
+            stop_big_loss=bool(params_now.get("lab_stop_big_loss", False)),
+            stop_big_win=bool(params_now.get("lab_stop_big_win", False)),
+        )
+    else:
+        sim_kept = cand_df.copy()
+        stops_df = pd.DataFrame()
+
+    sim_df = sim_kept
 
     n_real = int(len(real_df)) if real_df is not None else 0
     n_cand = int(len(cand_df)) if cand_df is not None else 0
