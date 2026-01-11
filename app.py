@@ -2466,6 +2466,28 @@ with lab_left:
             if n >= 5 and np.isfinite(med) and med < 0:
                 st.warning(f"🏆 Tras un ganador grande (RR≥2), suele haber devolución (mediana resto {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
 
+
+with lab_right:
+    st.markdown("**Filtros (opcional)**")
+    base_for_lab = t.copy()  # mismo universo que el Resumen rápido
+
+    # Aviso si faltan ENTRY (solo afecta a filtros que dependan de ENTRY/OR/ATR)
+    missing_entry = int(base_for_lab["entry_time"].isna().sum()) if ("entry_time" in base_for_lab.columns) else 0
+    if missing_entry > 0:
+        st.warning(
+            f"{missing_entry} operaciones no tienen ENTRY. En esas no se conoce Compra/Venta ni OR/ATR; "
+            "solo se podrán filtrar por hora usando EXIT como respaldo.",
+            icon="⚠️"
+        )
+
+    filtered, filter_notes = _apply_filters(base_for_lab)
+
+    st.write(f"Trades tras filtros: **{len(filtered)}** (de {len(base_for_lab)})")
+    if filter_notes:
+        st.caption("Notas de filtros: " + ", ".join(filter_notes))
+    else:
+        st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 🚀 Turbo Presets (A): lista de presets aplicables con 1 click
 # Objetivo: sugerir combinaciones simples (filtros + reglas) y permitir aplicarlas.
@@ -3083,50 +3105,27 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
 
             if st.button("🎛️ Aplicar este preset", key="turbo_apply_btn"):
                 _apply_preset(params)
-
-    # Comparativa principal: REAL (historial) vs SIMULADO (filtros + reglas)
-    # (bloque defensivo: evita NameError si cambian nombres de variables)
-    # ------------------------------------------------------------
     # ------------------------------------------------------------
     # Comparativa principal: REAL (universo) vs CANDIDATO (tras filtros) vs SIM (tras reglas)
-    # Calculamos todo aquí para que la vista previa sea consistente con "Aplicar".
+    # Nota: los filtros se definen en la columna derecha (lab_right) via _apply_filters().
     # ------------------------------------------------------------
-    real_df = df_real.copy() if (df_real is not None and not df_real.empty) else pd.DataFrame()
+    real_df = base_for_lab.copy() if ("base_for_lab" in locals() and base_for_lab is not None) else (t.copy() if (t is not None) else pd.DataFrame())
+    cand_df = filtered.copy() if ("filtered" in locals() and filtered is not None) else real_df.copy()
 
-    params_now = {
-        "lab_use_hours_filter": st.session_state.get("lab_use_hours_filter", False),
-        "lab_hours_allowed": st.session_state.get("lab_hours_allowed", []),
-        "lab_use_or_filter": st.session_state.get("lab_use_or_filter", False),
-        "lab_or_rng": st.session_state.get("lab_or_rng", None),
-        "lab_use_atr_filter": st.session_state.get("lab_use_atr_filter", False),
-        "lab_atr_rng": st.session_state.get("lab_atr_rng", None),
-        "lab_use_rules": st.session_state.get("lab_use_rules", True),
-        "lab_max_trades": st.session_state.get("lab_max_trades", 0),
-        "lab_max_loss": st.session_state.get("lab_max_loss", 0.0),
-        "lab_max_profit": st.session_state.get("lab_max_profit", 0.0),
-        "lab_max_consec_losses": st.session_state.get("lab_max_consec_losses", 0),
-        "lab_stop_big_loss": st.session_state.get("lab_stop_big_loss", False),
-        "lab_stop_big_win": st.session_state.get("lab_stop_big_win", False),
-    }
-
-    cand_df = _lab_filter_df_params(real_df, params_now) if (real_df is not None and not real_df.empty) else pd.DataFrame()
-    filtered = cand_df  # compat: usado en secciones "what-if" y "consejos"
-
-    if params_now.get("lab_use_rules", True):
+    if cand_df is None or cand_df.empty:
+        sim_df = pd.DataFrame()
+        stops_df = pd.DataFrame()
+    else:
         sim_kept, stops_df = _simulate_daily_rules(
             cand_df,
-            max_loss=float(params_now.get("lab_max_loss", 0.0) or 0.0),
-            max_profit=float(params_now.get("lab_max_profit", 0.0) or 0.0),
-            max_trades=int(params_now.get("lab_max_trades", 0) or 0),
-            max_consec_losses=int(params_now.get("lab_max_consec_losses", 0) or 0),
-            stop_big_loss=bool(params_now.get("lab_stop_big_loss", False)),
-            stop_big_win=bool(params_now.get("lab_stop_big_win", False)),
+            max_loss=float(max_loss or 0.0),
+            max_profit=float(max_profit or 0.0),
+            max_trades=int(max_trades or 0),
+            max_consec_losses=int(max_consec_losses or 0),
+            stop_big_loss=bool(stop_big_loss),
+            stop_big_win=bool(stop_big_win),
         )
-    else:
-        sim_kept = cand_df.copy()
-        stops_df = pd.DataFrame()
-
-    sim_df = sim_kept
+        sim_df = sim_kept
 
     n_real = int(len(real_df)) if real_df is not None else 0
     n_cand = int(len(cand_df)) if cand_df is not None else 0
