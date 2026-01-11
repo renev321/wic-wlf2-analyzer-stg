@@ -4,6 +4,10 @@ import numpy as np
 import json
 import plotly.express as px
 
+# Avoid NameError in optional analytics sections; will be overwritten when simulation produces it
+stops_df = pd.DataFrame()
+
+
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
 # --- TURBO: apply queued preset before widgets are created (prevents session_state/widget-key errors)
@@ -3103,6 +3107,11 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
     c3.metric("PnL real ($)", f"{pnl_real:.0f}")
     c4.metric("PnL simulado ($)", f"{pnl_sim:.0f}", delta=f"{(pnl_sim - pnl_real):.0f}")
     c5.metric("PF real / sim", f"{fmt(pf_real,2)} / {fmt(pf_sim,2)}")
+
+
+    # Guard: stops_df puede no existir si la simulación no generó tabla de días cortados
+    if "stops_df" not in locals():
+        stops_df = pd.DataFrame()
 
     d1, d2, d3 = st.columns(3)
     d1.metric("Omitidos por filtros", f"{omit_filtros}")
