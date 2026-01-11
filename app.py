@@ -7,6 +7,38 @@ import plotly.express as px
 # Avoid NameError in optional analytics sections; will be overwritten when simulation produces it
 stops_df = pd.DataFrame()
 
+# -------- Formatting helpers (global) --------
+def _is_nan(x):
+    try:
+        return x is None or (isinstance(x, float) and np.isnan(x))
+    except Exception:
+        return x is None
+
+def _fmt_money(x):
+    if _is_nan(x):
+        return "—"
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+def _fmt_dd(x):
+    if _is_nan(x):
+        return "—"
+    try:
+        return f"{abs(float(x)):,.0f}"
+    except Exception:
+        return str(x)
+
+def _fmt_pf(x):
+    if _is_nan(x):
+        return "—"
+    try:
+        v=float(x)
+        return f"{v:.2f}"
+    except Exception:
+        return str(x)
+
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
