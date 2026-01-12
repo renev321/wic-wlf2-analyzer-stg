@@ -43,6 +43,17 @@ def _fmt_pf(x):
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
 # --- TURBO: apply queued preset before widgets are created (prevents session_state/widget-key errors)
+
+
+# -------- Time label helpers (global) --------
+def _hour_block_label(h):
+    """Human label for a single hour block."""
+    try:
+        hh = int(h) % 24
+        return f"{hh:02d}:00"
+    except Exception:
+        return str(h)
+
 if "_turbo_pending_apply" in st.session_state:
     _params = st.session_state.pop("_turbo_pending_apply") or {}
     if isinstance(_params, dict):
