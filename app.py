@@ -2701,6 +2701,90 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         h = int(g.index[0])
         return _hour_block_label(h)
 
+
+    def _hours_to_labels(hours):
+        try:
+            return [_hour_block_label(int(h)) for h in hours]
+        except Exception:
+            return []
+
+    def _hours_best_sets(df_: pd.DataFrame, hour_col: str, pnl_col: str, max_single: int = 4):
+        """Devuelve listas de horas (ints) para probar en Turbo.
+        Incluye 'Todo el día' + varias opciones (top horas por mean pnl)."""
+        sets = [("Todo el día", None)]
+        if df_ is None or df_.empty:
+            return sets
+        if not hour_col or hour_col not in df_.columns:
+            return sets
+        if not pnl_col or pnl_col not in df_.columns:
+            return sets
+
+        tmp = df_[[hour_col, pnl_col]].copy()
+        tmp[hour_col] = pd.to_numeric(tmp[hour_col], errors="coerce")
+        tmp[pnl_col] = pd.to_numeric(tmp[pnl_col], errors="coerce")
+        tmp = tmp.dropna(subset=[hour_col, pnl_col])
+        if tmp.empty:
+            return sets
+
+        g = tmp.groupby(hour_col)[pnl_col].agg(count="count", mean="mean", total="sum")
+        # mínimo por hora para evitar ruido
+        min_n = 5
+        g = g[g["count"] >= min_n]
+        if g.empty:
+            return sets
+
+        g = g.sort_values(["mean", "count"], ascending=[False, False])
+        top_hours = [int(h) for h in g.head(max_single).index.tolist()]
+
+        for i, h in enumerate(top_hours, start=1):
+            sets.append((f"Hora top #{i} ({_hour_block_label(h)})", [h]))
+
+        if len(top_hours) >= 2:
+            k = min(3, len(top_hours))
+            sets.append((f"Top {k} horas", top_hours[:k]))
+
+        return sets
+
+    def _top_bins_for(df_: pd.DataFrame, col: str, pnl_col: str, top_k: int = 2, q: int = 5, min_n: int = 25):
+        """Encuentra top_k intervalos (lo 'rango') para una columna continua (OR/ATR),
+        rankeados por PF aproximado y media de pnl."""
+        if df_ is None or df_.empty or col not in df_.columns or pnl_col not in df_.columns:
+            return []
+
+        x = pd.to_numeric(df_[col], errors="coerce")
+        y = pd.to_numeric(df_[pnl_col], errors="coerce")
+        ok = x.notna() & y.notna()
+        if int(ok.sum()) < max(min_n * 2, min_n * q):
+            return []
+
+        try:
+            bins = pd.qcut(x[ok], q=q, duplicates="drop")
+        except Exception:
+            return []
+
+        tmp = pd.DataFrame({"bin": bins, "pnl": y[ok].values})
+
+        def _pf(s):
+            w = s[s > 0].sum()
+            l = -s[s < 0].sum()
+            return float(w / l) if l > 0 else (float("inf") if w > 0 else np.nan)
+
+        grp = tmp.groupby("bin")["pnl"]
+        stats = grp.agg(n="count", mean="mean")
+        stats["pf"] = grp.apply(_pf)
+        stats = stats[stats["n"] >= min_n]
+        if stats.empty:
+            return []
+
+        stats = stats.sort_values(["pf", "mean", "n"], ascending=[False, False, False]).head(int(top_k))
+        out = []
+        for b in stats.index.tolist():
+            try:
+                out.append((float(b.left), float(b.right)))
+            except Exception:
+                pass
+        return out
+
     def _turbo_eval_preset(df_real: pd.DataFrame, params: dict) -> dict:
         # Filtrar (solo simulación)
         filt = _lab_filter_df_params(df_real, params)
