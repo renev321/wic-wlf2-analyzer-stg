@@ -6,10 +6,16 @@ import plotly.express as px
 
 from datetime import datetime, date
 import io
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
+# --- Optional dependency: ReportLab (PDF export) ---
+# Streamlit Cloud may not include it unless you add `reportlab` to requirements.txt.
+REPORTLAB_AVAILABLE = True
+try:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+except ModuleNotFoundError:
+    REPORTLAB_AVAILABLE = False
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
@@ -1538,6 +1544,70 @@ def plot_heatmap_weekday_hour_by_side(t: pd.DataFrame, min_trades: int):
         _one(t, f"Heatmap (Día x Hora) | ≥ {min_trades} trades/celda")
 
 
+
+# ============================================================
+# HTML export for ResultLab (fallback when ReportLab is missing)
+# ============================================================
+def build_resultlab_html(title: str,
+                         global_filters: dict,
+                         global_notes: list,
+                         lab_filter_notes: list,
+                         lab_cfg_lines: list,
+                         metrics: dict) -> str:
+    def esc(x):
+        return (str(x)
+                .replace("&","&amp;")
+                .replace("<","&lt;")
+                .replace(">","&gt;"))
+    def li(items):
+        if not items:
+            return "<p><em>(sin notas)</em></p>"
+        return "<ul>" + "".join(f"<li>{esc(i)}</li>" for i in items) + "</ul>"
+    def table(d):
+        rows = "".join(
+            f"<tr><th style='text-align:left;padding:6px 10px;border:1px solid #ddd;background:#f7f7f7'>{esc(k)}</th>"
+            f"<td style='padding:6px 10px;border:1px solid #ddd'>{esc(v)}</td></tr>"
+            for k, v in (d or {}).items()
+        )
+        return f"<table style='border-collapse:collapse;width:100%;font-size:14px'>{rows}</table>"
+
+    cfg_text = "\n".join(lab_cfg_lines or [])
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{esc(title)}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 28px; }}
+h1 {{ margin: 0 0 8px 0; }}
+h2 {{ margin-top: 22px; border-bottom: 1px solid #eee; padding-bottom: 6px; }}
+.small {{ color: #666; font-size: 12px; }}
+.code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; background:#f6f8fa; padding:10px; border:1px solid #eee; border-radius:8px; white-space:pre-wrap; }}
+</style>
+</head>
+<body>
+<h1>{esc(title)}</h1>
+<div class="small">Generado: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+
+<h2>Filtros globales</h2>
+{table(global_filters or {})}
+<h3>Notas</h3>
+{li(global_notes)}
+
+<h2>Filtros del Lab</h2>
+{li(lab_filter_notes)}
+
+<h2>Configuración del Lab</h2>
+    <div class="code">{esc(cfg_text)}</div>
+
+<h2>Métricas</h2>
+{table(metrics or {})}
+
+<p class="small">Tip: abre este HTML y usa “Imprimir → Guardar como PDF”.</p>
+</body>
+</html>"""
+    return html
+
 # ============================================================
 # PDF export for ResultLab
 # ============================================================
@@ -1549,6 +1619,8 @@ def build_resultlab_pdf_bytes(title: str,
                               metrics: dict,
                               stops_df: pd.DataFrame | None = None,
                               whatif_df: pd.DataFrame | None = None) -> bytes:
+    if not REPORTLAB_AVAILABLE:
+        raise ModuleNotFoundError('reportlab is not installed')
     styles = getSampleStyleSheet()
     story = []
     story.append(Paragraph(title, styles["Title"]))
@@ -2904,26 +2976,49 @@ else:
 
     ts_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_name = f"ResultLab_{ts_name}.pdf"
-    try:
-        pdf_bytes = build_resultlab_pdf_bytes(
+
+    if REPORTLAB_AVAILABLE:
+        try:
+            pdf_bytes = build_resultlab_pdf_bytes(
+                title="ResultLab — Reporte",
+                global_filters=gf_dict if 'gf_dict' in globals() else {},
+                global_notes=gf_notes if 'gf_notes' in globals() else [],
+                lab_filter_notes=filter_notes,
+                lab_cfg_lines=cfg_lines,
+                metrics=pdf_metrics,
+                stops_df=stops_df,
+                whatif_df=(wf2 if 'wf2' in locals() else None),
+            )
+            st.download_button(
+                "📄 Descargar reporte PDF (filtros + resultados)",
+                data=pdf_bytes,
+                file_name=pdf_name,
+                mime="application/pdf",
+                help="Genera un PDF con filtros globales, configuración del Lab, y métricas real vs simulado."
+            )
+        except Exception as _e:
+            st.warning(f"No se pudo generar el PDF: {_e}")
+    else:
+        st.info(
+            "🧩 Para habilitar el PDF en Streamlit Cloud, agrega **reportlab** a tu `requirements.txt` y redeploy.\n\n"
+            "Ejemplo: `reportlab>=4.0`\n\n"
+            "Mientras tanto, puedes descargar un reporte en **HTML** (imprimible) abajo."
+        )
+        html = build_resultlab_html(
             title="ResultLab — Reporte",
             global_filters=gf_dict if 'gf_dict' in globals() else {},
             global_notes=gf_notes if 'gf_notes' in globals() else [],
             lab_filter_notes=filter_notes,
             lab_cfg_lines=cfg_lines,
             metrics=pdf_metrics,
-            stops_df=stops_df,
-            whatif_df=(wf2 if 'wf2' in locals() else None),
         )
         st.download_button(
-            "📄 Descargar reporte PDF (filtros + resultados)",
-            data=pdf_bytes,
-            file_name=pdf_name,
-            mime="application/pdf",
-            help="Genera un PDF con filtros globales, configuración del Lab, y métricas real vs simulado."
+            "🧾 Descargar reporte HTML (imprimible)",
+            data=html.encode("utf-8"),
+            file_name=pdf_name.replace(".pdf", ".html"),
+            mime="text/html",
+            help="Abre el HTML y usa Imprimir → Guardar como PDF si lo necesitas."
         )
-    except Exception as _e:
-        st.warning(f"No se pudo generar el PDF: {_e}")
 
 
     # Equity curve
