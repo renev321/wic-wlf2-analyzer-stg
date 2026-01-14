@@ -1280,23 +1280,39 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
     ss.setdefault("gf_dom_min", 1)
     ss.setdefault("gf_dom_max", 31)
 
+    # Clamp year defaults to current dataset bounds (important if dataset changes between runs)
+    ss["gf_year_min"] = max(dmin.year, min(int(ss.get("gf_year_min", dmin.year)), dmax.year))
+    ss["gf_year_max"] = max(dmin.year, min(int(ss.get("gf_year_max", dmax.year)), dmax.year))
+    if ss["gf_year_min"] > ss["gf_year_max"]:
+        ss["gf_year_min"], ss["gf_year_max"] = dmin.year, dmax.year
+
     with st.expander("📅 Filtro global de fechas (afecta TODO el dashboard)", expanded=True):
         r1c1, r1c2, r1c3 = st.columns([2,2,1])
         with r1c1:
-            d_from, d_to = st.date_input(
-                "Rango (Desde / Hasta)",
-                value=(ss["gf_d_from"], ss["gf_d_to"]),
-                min_value=dmin,
-                max_value=dmax
-            )
+            # Si el dataset cae en un solo día, Streamlit puede no manejar bien el selector de rango
+            if dmin == dmax:
+                st.date_input("Rango (Desde / Hasta)", value=dmin, disabled=True)
+                d_from = d_to = dmin
+            else:
+                d_from, d_to = st.date_input(
+                    "Rango (Desde / Hasta)",
+                    value=(ss["gf_d_from"], ss["gf_d_to"]),
+                    min_value=dmin,
+                    max_value=dmax
+                )
         with r1c2:
-            year_min, year_max = st.slider(
-                "Años (min / max)",
-                min_value=dmin.year,
-                max_value=dmax.year,
-                value=(int(ss["gf_year_min"]), int(ss["gf_year_max"])),
-                step=1
-            )
+            # Streamlit no permite un 'range slider' si min_value == max_value (p.ej. dataset de un solo año)
+            if dmin.year == dmax.year:
+                st.text_input("Año", value=str(dmin.year), disabled=True)
+                year_min = year_max = dmin.year
+            else:
+                year_min, year_max = st.slider(
+                    "Años (min / max)",
+                    min_value=dmin.year,
+                    max_value=dmax.year,
+                    value=(int(ss["gf_year_min"]), int(ss["gf_year_max"])),
+                    step=1
+                )
         with r1c3:
             if st.button("🔄 Reset", help="Vuelve al rango completo del dataset"):
                 ss["gf_d_from"], ss["gf_d_to"] = dmin, dmax
