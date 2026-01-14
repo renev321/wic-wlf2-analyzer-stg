@@ -1542,6 +1542,86 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 # ============================================================
 # Heatmap weekday x hour split by Buy/Sell (Green/Red)
 # ============================================================
+
+# ============================================================
+# What-if sizing: simulate different TP1 vs Runner contract split
+# (No scaling-in. Same trade path, just different quantity allocation.)
+# ============================================================
+def apply_split_tp1_runner(df: pd.DataFrame, total_contracts: int, tp1_contracts: int):
+    """Return a copy of df with tradeRealized adjusted for a what-if split between TP1 and Runner.
+
+    Assumptions based on your current log schema:
+    - qtyTP1 / qtyRunner are the ORIGINAL sizes used in the trade.
+    - exitReason == 'TRAIL' implies TP1 was filled and the runner exited later (trail).
+      For other exitReason values (SL/BE/SESSION_END), TP1 did not fill in your current behavior,
+      so all contracts are assumed to exit the same way (split does not change per-contract outcome).
+    """
+    if df is None or df.empty:
+        return df
+
+    total_contracts = int(max(1, total_contracts))
+    tp1_contracts = int(max(0, min(tp1_contracts, total_contracts)))
+    runner_contracts = int(total_contracts - tp1_contracts)
+
+    z = df.copy()
+
+    # Keep original for reporting/debug
+    if "tradeRealized" in z.columns:
+        z["tradeRealized_orig"] = z["tradeRealized"]
+    else:
+        return z
+
+    # Ensure tick_value exists
+    if "tick_value" not in z.columns:
+        if "tickSize" in z.columns and "pointValue" in z.columns:
+            z["tick_value"] = pd.to_numeric(z["tickSize"], errors="coerce") * pd.to_numeric(z["pointValue"], errors="coerce")
+        else:
+            z["tick_value"] = np.nan
+
+    tv = pd.to_numeric(z["tick_value"], errors="coerce")
+    tr = pd.to_numeric(z["tradeRealized_orig"], errors="coerce")
+    ticks_total = tr / tv
+
+    # Base per-contract outcome (used when TP1 did NOT fill)
+    qtot = pd.to_numeric(z.get("qty_total", np.nan), errors="coerce")
+    per_contract = np.where((qtot > 0) & np.isfinite(ticks_total), ticks_total / qtot, np.nan)
+
+    # TRAIL trades: infer runner ticks from original split
+    q1 = pd.to_numeric(z.get("qtyTP1", 0), errors="coerce").fillna(0)
+    qr = pd.to_numeric(z.get("qtyRunner", 0), errors="coerce").fillna(0)
+    tp1_ticks = pd.to_numeric(z.get("tp1Ticks", np.nan), errors="coerce")
+
+    exit_reason = z.get("exitReason", pd.Series([None]*len(z)))
+    is_trail = exit_reason.astype(str).str.upper().eq("TRAIL")
+
+    runner_ticks = np.where(
+        (is_trail) & (qr > 0) & np.isfinite(ticks_total) & np.isfinite(tp1_ticks),
+        (ticks_total - (q1 * tp1_ticks)) / qr,
+        np.nan
+    )
+
+    # Simulated ticks total
+    sim_ticks = np.where(
+        is_trail & np.isfinite(runner_ticks) & np.isfinite(tp1_ticks),
+        (tp1_contracts * tp1_ticks) + (runner_contracts * runner_ticks),
+        (total_contracts * per_contract)
+    )
+
+    # Convert back to $
+    sim_realized = sim_ticks * tv
+
+    # Fallback: if something is missing, scale original PnL by (newTotal/origTotal)
+    scale = np.where((qtot > 0) & np.isfinite(qtot), total_contracts / qtot, 1.0)
+    sim_realized = np.where(np.isfinite(sim_realized), sim_realized, tr * scale)
+
+    z["tradeRealized"] = sim_realized
+    z["split_total"] = total_contracts
+    z["split_tp1"] = tp1_contracts
+    z["split_runner"] = runner_contracts
+    z["split_mode"] = np.where(is_trail, "TRAIL(tp1+runner)", "NO_TP1(all-exit)")
+    return z
+
+
 def plot_heatmap_weekday_hour_by_side(t: pd.DataFrame, min_trades: int):
     if t is None or t.empty:
         st.info("No hay datos para el heatmap.")
@@ -2957,17 +3037,87 @@ with lab_right:
         st.warning(f"{missing_entry} operaciones no tienen ENTRY. En esas no se conoce Compra/Venta ni OR/EWO/ATR/DeltaRatio; "
                    "solo se podrán filtrar por hora usando EXIT como respaldo.", icon="⚠️")
 
-    filtered, filter_notes = _apply_filters(base_for_lab)
+    filtered_raw, filter_notes = _apply_filters(base_for_lab)
+
+    # --- What-if: simulate different TP1 vs Runner contract split (no scale-in) ---
+    split_enabled = bool(st.session_state.get("split_enable", False))
+    if split_enabled:
+        total_c = int(st.session_state.get("split_total", 1) or 1)
+        tp1_c = int(st.session_state.get("split_tp1", 0) or 0)
+        filtered = apply_split_tp1_runner(filtered_raw, total_c, tp1_c)
+    else:
+        filtered = filtered_raw
 
     st.write(f"Trades tras filtros: **{len(filtered)}** (de {len(base_for_lab)})")
     if filter_notes:
         st.caption("Filtros activos: " + ", ".join(filter_notes))
     else:
         st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
+
+    # ------------------------------------------------------------
+    # 🧮 What-if: split contratos TP1 vs Runner (sin scale-in)
+    # ------------------------------------------------------------
+    with st.expander("🧮 What-if: Split contratos TP1 vs Runner (sin cambiar entradas/exits)", expanded=False):
+        st.checkbox("Activar simulación de split", key="split_enable",
+                    help="Simula cómo habría cambiado el PnL si repartes los contratos entre TP1 y Runner de otra forma, "
+                         "sin cambiar el comportamiento del trade (sin scale-in).")
+
+        if bool(st.session_state.get("split_enable", False)):
+            # Defaults from dataset (mode -> median -> 1)
+            _default_total = 1
+            if "qty_total" in base_for_lab.columns:
+                _v = pd.to_numeric(base_for_lab["qty_total"], errors="coerce").dropna()
+                if len(_v):
+                    _m = _v.mode()
+                    _default_total = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
+                    _default_total = max(1, _default_total)
+
+            _default_tp1 = 0
+            if "qtyTP1" in base_for_lab.columns:
+                _v2 = pd.to_numeric(base_for_lab["qtyTP1"], errors="coerce").dropna()
+                if len(_v2):
+                    _m2 = _v2.mode()
+                    _default_tp1 = int(_m2.iloc[0]) if len(_m2) else int(round(float(_v2.median())))
+                    _default_tp1 = max(0, _default_tp1)
+
+            total_c = st.number_input(
+                "Total contratos (TP1 + Runner)",
+                min_value=1, max_value=50,
+                value=int(st.session_state.get("split_total", _default_total)),
+                step=1,
+                key="split_total",
+                help="Mantén esto fijo si solo quieres cambiar el reparto TP1 vs Runner."
+            )
+            tp1_c = st.slider(
+                "Contratos en TP1",
+                min_value=0, max_value=int(total_c),
+                value=int(min(st.session_state.get("split_tp1", _default_tp1), total_c)),
+                step=1,
+                key="split_tp1"
+            )
+            runner_c = int(total_c - tp1_c)
+            st.caption(f"Runner = **{runner_c}** contratos.")
+
+            # Info útil: en tus logs actuales, el split solo impacta trades TRAIL (cuando TP1 se ejecutó)
+            if "exitReason" in filtered_raw.columns:
+                _trail_n = int(filtered_raw["exitReason"].astype(str).str.upper().eq("TRAIL").sum())
+                st.caption(f"En esta muestra, trades con **TRAIL** (TP1 ejecutado) = **{_trail_n}**. "
+                           "En SL/BE, TP1 no se ejecutó en tus logs actuales, así que el split casi no cambia nada.")
 # Simulación
 if filtered is None or filtered.empty:
     st.info("Con los filtros actuales no quedan trades para simular.")
 else:
+    # Simulación de reglas diarias (sobre el universo filtrado)
+    split_enabled = bool(st.session_state.get("split_enable", False))
+    sim_kept_base = None
+    pnl_sim_base = None
+    pf_sim_base = None
+    if split_enabled:
+        # Baseline: mismo set filtrado, SIN aplicar split (para comparar)
+        sim_kept_base, _ = _simulate_daily_rules(filtered_raw, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
+        pnl_sim_base = float(sim_kept_base["tradeRealized"].fillna(0).sum()) if (sim_kept_base is not None and len(sim_kept_base)) else 0.0
+        pf_sim_base  = profit_factor(sim_kept_base) if (sim_kept_base is not None and len(sim_kept_base)) else np.nan
+
     sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
 
     # Comparativa principal: real vs simulado (filtros + reglas)
@@ -2999,6 +3149,17 @@ else:
     c3.metric("PnL real ($)", f"{pnl_real:.0f}")
     c4.metric("PnL simulado ($)", f"{pnl_sim:.0f}", delta=f"{(pnl_sim - pnl_real):.0f}")
     c5.metric("PF real / sim", f"{fmt(pf_real,2)} / {fmt(pf_sim,2)}")
+
+    if split_enabled:
+        _tot = int(st.session_state.get("split_total", 0) or 0)
+        _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
+        _run = max(0, _tot - _tp1)
+        if pnl_sim_base is not None:
+            st.caption(
+                f"🧮 Split activo: total={_tot} | TP1={_tp1} | runner={_run}  ·  "
+                f"PnL sim(sin split)={pnl_sim_base:.0f} → PnL sim(split)={pnl_sim:.0f} (Δ {(pnl_sim - pnl_sim_base):.0f})  ·  "
+                f"PF sim(sin split)={fmt(pf_sim_base,2)} → PF sim(split)={fmt(pf_sim,2)}"
+            )
 
     d1, d2, d3 = st.columns(3)
     d1.metric("Omitidos por filtros", f"{omit_filtros}")
@@ -3041,6 +3202,13 @@ else:
         cfg_lines.append("Stop por stop‑out fuerte (RR ≤ -1)")
     if stop_big_win:
         cfg_lines.append("Stop por ganador grande (RR ≥ 2)")
+
+    # Add split settings to report
+    if split_enabled:
+        _tot = int(st.session_state.get("split_total", 0) or 0)
+        _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
+        _run = max(0, _tot - _tp1)
+        cfg_lines.append(f"Split TP1/Runner simulado: total={_tot} | TP1={_tp1} | runner={_run}")
 
     pdf_metrics = {
         "Trades reales": n_real,
@@ -3087,13 +3255,24 @@ else:
             "Ejemplo: `reportlab>=4.0`\n\n"
             "Mientras tanto, puedes descargar un reporte en **HTML** (imprimible) abajo."
         )
+        lab_filters_dict = _collect_filter_settings("lab_")
+        if split_enabled:
+            _tot = int(st.session_state.get("split_total", 0) or 0)
+            _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
+            _run = max(0, _tot - _tp1)
+            lab_filters_dict.update({
+                "split_enabled": True,
+                "split_total": _tot,
+                "split_tp1": _tp1,
+                "split_runner": _run,
+            })
         html = build_resultlab_html(
             title="ResultLab — Reporte",
             global_filters=gf_dict if 'gf_dict' in globals() else {},
             global_notes=gf_notes if 'gf_notes' in globals() else [],
             lab_filter_notes=filter_notes,
             lab_cfg_lines=cfg_lines,
-            lab_filters=_collect_filter_settings("lab_"),
+            lab_filters=lab_filters_dict,
             metrics=pdf_metrics,
         )
         st.download_button(
