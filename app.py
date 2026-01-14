@@ -1650,6 +1650,129 @@ def apply_split_tp1_runner(
     return z
 
 
+# ============================================================
+# Goal Search: find TP1/Runner combos that hit target PnL and MaxDD
+# ============================================================
+def _calc_max_dd_from_trades(df_: pd.DataFrame) -> float:
+    """Approx max drawdown from cumulative equity (absolute $)."""
+    if df_ is None or df_.empty or "tradeRealized" not in df_.columns:
+        return 0.0
+    z = df_.copy()
+    time_col = "exit_time" if "exit_time" in z.columns else ("entry_time" if "entry_time" in z.columns else None)
+    if time_col and pd.api.types.is_datetime64_any_dtype(z[time_col]):
+        z = z[z[time_col].notna()].sort_values(time_col)
+    pnl = pd.to_numeric(z["tradeRealized"], errors="coerce").fillna(0.0).to_numpy()
+    if pnl.size == 0:
+        return 0.0
+    eq = np.cumsum(pnl)
+    peak = np.maximum.accumulate(eq)
+    dd = eq - peak
+    md = float(np.min(dd)) if dd.size else 0.0
+    return float(abs(md)) if md < 0 else 0.0
+
+
+def _simulate_metrics_for_df(df_for_sim: pd.DataFrame,
+                            *,
+                            max_loss: float,
+                            max_profit: float,
+                            max_trades: int,
+                            max_consec_losses: int,
+                            stop_big_loss: bool,
+                            stop_big_win: bool):
+    """Run daily-guard simulation and return key metrics."""
+    sim_kept, stops_df = _simulate_daily_rules(
+        df_for_sim, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win
+    )
+    pnl = float(pd.to_numeric(sim_kept.get("tradeRealized", 0), errors="coerce").fillna(0).sum()) if (sim_kept is not None and len(sim_kept)) else 0.0
+    pf  = profit_factor(sim_kept) if (sim_kept is not None and len(sim_kept)) else np.nan
+    max_dd = _calc_max_dd_from_trades(sim_kept)
+    n_sim = int(len(sim_kept)) if sim_kept is not None else 0
+    days_cut = int(stops_df["fecha"].nunique()) if (stops_df is not None and not stops_df.empty and "fecha" in stops_df.columns) else 0
+    return {
+        "n_sim": n_sim,
+        "pnl": pnl,
+        "pf": float(pf) if np.isfinite(pf) else np.nan,
+        "max_dd": float(max_dd),
+        "days_cut": days_cut,
+    }
+
+
+def _goal_search_tp1_runner(
+    df_candidates: pd.DataFrame,
+    *,
+    tp1_min: int,
+    tp1_max: int,
+    tp1_step: int,
+    run_min: int,
+    run_max: int,
+    run_step: int,
+    total_max: int,
+    goal_pnl: float,
+    goal_max_dd: float,
+    max_combos: int,
+    rules: dict,
+):
+    """Brute-force search across TP1/Runner contract choices."""
+    if df_candidates is None or df_candidates.empty:
+        return pd.DataFrame()
+
+    tp1_vals = list(range(int(tp1_min), int(tp1_max) + 1, int(max(1, tp1_step))))
+    run_vals = list(range(int(run_min), int(run_max) + 1, int(max(1, run_step))))
+
+    combos = []
+    for tp1 in tp1_vals:
+        for run in run_vals:
+            tot = tp1 + run
+            if tot <= 0:
+                continue
+            if total_max and tot > int(total_max):
+                continue
+            combos.append((tp1, run, tot))
+            if max_combos and len(combos) >= int(max_combos):
+                break
+        if max_combos and len(combos) >= int(max_combos):
+            break
+
+    rows = []
+    prog = st.progress(0.0)
+    status = st.empty()
+
+    for i, (tp1, run, tot) in enumerate(combos):
+        status.caption(f"Probando combo {i+1}/{len(combos)}: TP1={tp1}, Runner={run} (total={tot})")
+        df_sim = apply_split_tp1_runner(df_candidates, tp1_contracts=tp1, runner_contracts=run)
+        met = _simulate_metrics_for_df(df_sim, **rules)
+        rows.append({
+            "TP1": tp1,
+            "Runner": run,
+            "Total": tot,
+            "PnL_sim": met["pnl"],
+            "MaxDD_sim": met["max_dd"],
+            "PF_sim": met["pf"],
+            "Trades_sim": met["n_sim"],
+            "DaysCut": met["days_cut"],
+        })
+        if len(combos) > 0:
+            prog.progress((i + 1) / len(combos))
+
+    status.empty()
+    prog.empty()
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["Hit_PnL"] = out["PnL_sim"] >= float(goal_pnl)
+    out["Hit_DD"]  = out["MaxDD_sim"] <= float(goal_max_dd)
+    out["Hit"]     = out["Hit_PnL"] & out["Hit_DD"]
+
+    # Score: how close to goals (lower is better) but prefer higher PnL
+    gp = float(goal_pnl) if goal_pnl else 1.0
+    gd = float(goal_max_dd) if goal_max_dd else 1.0
+    out["Penalty"] = (np.maximum(0.0, float(goal_pnl) - out["PnL_sim"]) / gp) + (np.maximum(0.0, out["MaxDD_sim"] - float(goal_max_dd)) / gd)
+    out = out.sort_values(["Hit", "Penalty", "PnL_sim"], ascending=[False, True, False]).reset_index(drop=True)
+    return out
+
+
 def plot_heatmap_weekday_hour_by_side(t: pd.DataFrame, min_trades: int):
     if t is None or t.empty:
         st.info("No hay datos para el heatmap.")
@@ -3142,6 +3265,89 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
                 f"🔎 Trades con **TRAIL** (donde el split impacta más) en esta muestra: **{_trail_n}**. "
                 "En SL/BE normalmente se escala por contrato."
             )
+
+        st.markdown("---")
+        with st.expander("🎯 Objetivos: encontrar combos TP1/Runner que cumplan PnL + DD", expanded=False):
+            st.caption("Idea: defines una meta (PnL objetivo y DD máximo) y el Lab prueba combinaciones de contratos (TP1/Runner) "
+                       "sobre el mismo set filtrado y con tus reglas diarias actuales.")
+            g1, g2 = st.columns(2)
+            with g1:
+                goal_pnl = st.number_input("💰 Meta PnL simulado ($)", min_value=0.0,
+                                           value=float(st.session_state.get("goal_pnl", 20000.0)), step=500.0,
+                                           key="goal_pnl")
+            with g2:
+                goal_dd = st.number_input("🛡️ Máx Drawdown simulado permitido ($)", min_value=0.0,
+                                          value=float(st.session_state.get("goal_dd", 4000.0)), step=250.0,
+                                          key="goal_dd")
+
+            st.markdown("**Espacio de búsqueda (cuánto probar)**")
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                tp1_min = st.number_input("TP1 min", min_value=0, max_value=300,
+                                          value=int(st.session_state.get("goal_tp1_min", 0)), step=1, key="goal_tp1_min")
+                tp1_max = st.number_input("TP1 max", min_value=0, max_value=300,
+                                          value=int(st.session_state.get("goal_tp1_max", 12)), step=1, key="goal_tp1_max")
+                tp1_step = st.number_input("TP1 step", min_value=1, max_value=50,
+                                           value=int(st.session_state.get("goal_tp1_step", 1)), step=1, key="goal_tp1_step")
+            with s2:
+                run_min = st.number_input("Runner min", min_value=0, max_value=300,
+                                          value=int(st.session_state.get("goal_run_min", 0)), step=1, key="goal_run_min")
+                run_max = st.number_input("Runner max", min_value=0, max_value=300,
+                                          value=int(st.session_state.get("goal_run_max", 6)), step=1, key="goal_run_max")
+                run_step = st.number_input("Runner step", min_value=1, max_value=50,
+                                           value=int(st.session_state.get("goal_run_step", 1)), step=1, key="goal_run_step")
+            with s3:
+                total_max = st.number_input("Total máx (TP1+Runner)", min_value=1, max_value=600,
+                                            value=int(st.session_state.get("goal_total_max", 20)), step=1, key="goal_total_max")
+                max_combos = st.number_input("Máx combos a probar", min_value=10, max_value=5000,
+                                             value=int(st.session_state.get("goal_max_combos", 250)), step=10, key="goal_max_combos")
+
+            rules = dict(
+                max_loss=float(max_loss or 0.0),
+                max_profit=float(max_profit or 0.0),
+                max_trades=int(max_trades or 0),
+                max_consec_losses=int(max_consec_losses or 0),
+                stop_big_loss=bool(stop_big_loss),
+                stop_big_win=bool(stop_big_win),
+            )
+
+            st.caption("Nota: si subes contratos, los $ por trade cambian y tus reglas diarias pueden cortar días antes → menos trades simulados. "
+                       "Eso es parte del comportamiento realista.")
+
+            if st.button("🔎 Buscar combinaciones", key="goal_search_btn"):
+                res = _goal_search_tp1_runner(
+                    filtered_raw,
+                    tp1_min=int(tp1_min), tp1_max=int(tp1_max), tp1_step=int(tp1_step),
+                    run_min=int(run_min), run_max=int(run_max), run_step=int(run_step),
+                    total_max=int(total_max),
+                    goal_pnl=float(goal_pnl),
+                    goal_max_dd=float(goal_dd),
+                    max_combos=int(max_combos),
+                    rules=rules,
+                )
+                st.session_state["goal_search_res"] = res
+
+            res = st.session_state.get("goal_search_res", None)
+            if isinstance(res, pd.DataFrame) and not res.empty:
+                hit_n = int(res["Hit"].sum()) if "Hit" in res.columns else 0
+                st.success(f"Encontrados **{hit_n}** combos que cumplen: PnL ≥ {goal_pnl:.0f} y MaxDD ≤ {goal_dd:.0f}.") if hit_n > 0 else st.warning(
+                    f"No se encontraron combos que cumplan ambos objetivos. Te muestro los más cercanos.")
+                show_cols = ["TP1", "Runner", "Total", "PnL_sim", "MaxDD_sim", "PF_sim", "Trades_sim", "DaysCut", "Hit"]
+                for c in show_cols:
+                    if c not in res.columns:
+                        show_cols.remove(c)
+                st.dataframe(res[show_cols].head(50), use_container_width=True)
+
+                # Mini scatter: PnL vs MaxDD (opcional)
+                try:
+                    _sc = res.head(200).copy()
+                    fig = px.scatter(_sc, x="MaxDD_sim", y="PnL_sim", hover_data=["TP1","Runner","Total","PF_sim","Trades_sim"],
+                                     color="Hit", title="PnL vs MaxDD (combos probados)")
+                    fig.update_layout(height=380, margin=dict(l=10,r=10,t=45,b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    pass
+
     else:
         st.caption("Modo mago apagado: la simulación usa tus PnL reales (sin re-escalar por contratos).")
 
