@@ -1295,6 +1295,34 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
     ss.setdefault("gf_dom_min", 1)
     ss.setdefault("gf_dom_max", 31)
 
+    # Clamp stored date defaults to current dataset bounds (important when user loads new files)
+    def _safe_to_date(x, fallback: date) -> date:
+        try:
+            if x is None:
+                return fallback
+            if isinstance(x, datetime):
+                return x.date()
+            if isinstance(x, pd.Timestamp):
+                return x.to_pydatetime().date()
+            if isinstance(x, str):
+                # Accept ISO strings like '2025-01-14'
+                return date.fromisoformat(x[:10])
+            if isinstance(x, date):
+                return x
+        except Exception:
+            return fallback
+        return fallback
+
+    gf_from = _safe_to_date(ss.get("gf_d_from"), dmin)
+    gf_to   = _safe_to_date(ss.get("gf_d_to"), dmax)
+    # Clamp to current bounds
+    gf_from = max(dmin, min(gf_from, dmax))
+    gf_to   = max(dmin, min(gf_to, dmax))
+    # Ensure ordering
+    if gf_from > gf_to:
+        gf_from, gf_to = dmin, dmax
+    ss["gf_d_from"], ss["gf_d_to"] = gf_from, gf_to
+
     # Clamp year defaults to current dataset bounds (important if dataset changes between runs)
     ss["gf_year_min"] = max(dmin.year, min(int(ss.get("gf_year_min", dmin.year)), dmax.year))
     ss["gf_year_max"] = max(dmin.year, min(int(ss.get("gf_year_max", dmax.year)), dmax.year))
@@ -1309,9 +1337,10 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
                 st.date_input("Rango (Desde / Hasta)", value=dmin, disabled=True)
                 d_from = d_to = dmin
             else:
+                # Use clamped values so Streamlit never receives out-of-bounds defaults
                 d_from, d_to = st.date_input(
                     "Rango (Desde / Hasta)",
-                    value=(ss["gf_d_from"], ss["gf_d_to"]),
+                    value=(gf_from, gf_to),
                     min_value=dmin,
                     max_value=dmax
                 )
