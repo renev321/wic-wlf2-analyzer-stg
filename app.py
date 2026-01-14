@@ -1605,6 +1605,26 @@ def plot_heatmap_weekday_hour_by_side(t: pd.DataFrame, min_trades: int):
 
 
 
+
+def _collect_filter_settings(prefix: str) -> dict:
+    """Collect widget settings from st.session_state by prefix, in a report-friendly dict."""
+    out = {}
+    try:
+        for k in list(st.session_state.keys()):
+            if not k.startswith(prefix):
+                continue
+            v = st.session_state.get(k)
+            # make it printable
+            if isinstance(v, (list, tuple, set)):
+                vv = ", ".join([str(x) for x in v])
+            else:
+                vv = str(v)
+            out[k] = vv
+    except Exception:
+        pass
+    return out
+
+
 # ============================================================
 # HTML export for ResultLab (fallback when ReportLab is missing)
 # ============================================================
@@ -1613,6 +1633,7 @@ def build_resultlab_html(title: str,
                          global_notes: list,
                          lab_filter_notes: list,
                          lab_cfg_lines: list,
+                         lab_filters: dict,
                          metrics: dict) -> str:
     def esc(x):
         return (str(x)
@@ -1655,6 +1676,8 @@ h2 {{ margin-top: 22px; border-bottom: 1px solid #eee; padding-bottom: 6px; }}
 {li(global_notes)}
 
 <h2>Filtros del Lab</h2>
+{table(lab_filters or {})}
+<h3>Notas</h3>
 {li(lab_filter_notes)}
 
 <h2>Configuración del Lab</h2>
@@ -3070,6 +3093,7 @@ else:
             global_notes=gf_notes if 'gf_notes' in globals() else [],
             lab_filter_notes=filter_notes,
             lab_cfg_lines=cfg_lines,
+            lab_filters=_collect_filter_settings("lab_"),
             metrics=pdf_metrics,
         )
         st.download_button(
