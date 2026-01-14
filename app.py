@@ -3067,73 +3067,45 @@ with lab_right:
 
     filtered_raw, filter_notes = _apply_filters(base_for_lab)
 # --- 🧙 What-if: cambiar contratos TP1/Runner (sin tocar entradas/salidas) ---
-split_enabled = bool(st.session_state.get("split_enable", False))
-if split_enabled:
-    tp1_c = int(st.session_state.get("split_tp1", 0) or 0)
-    run_c = int(st.session_state.get("split_runner", 0) or 0)
-    filtered = apply_split_tp1_runner(
-        filtered_raw,
-        tp1_contracts=tp1_c,
-        runner_contracts=run_c,
-    )
-else:
-    filtered = filtered_raw
+# Este módulo NO cambia entradas/salidas: solo re-escala el PnL del trade como si hubieras usado otro tamaño.
+# - En TRAIL: descompone el trade en TP1 (tp1Ticks) + runner (ticks implícitos) y re-arma con nuevos contratos.
+# - En SL/BE/otros: escala por PnL por contrato (aprox).
+_default_tp1 = 3
+_default_runner = 2
 
-    st.write(f"Trades tras filtros: **{len(filtered)}** (de {len(base_for_lab)})")
-    if filter_notes:
-        st.caption("Filtros activos: " + ", ".join(filter_notes))
-    else:
-        st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
+if "qtyTP1" in base_for_lab.columns:
+    _v = pd.to_numeric(base_for_lab["qtyTP1"], errors="coerce").dropna()
+    if len(_v):
+        _m = _v.mode()
+        _default_tp1 = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
+        _default_tp1 = max(0, _default_tp1)
 
-    # ------------------------------------------------------------
-    # 🧮 What-if: split contratos TP1 vs Runner (sin scale-in)
-    # ------------------------------------------------------------
-    
-# ------------------------------------------------------------
-# 🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner)
-# ------------------------------------------------------------
+if "qtyRunner" in base_for_lab.columns:
+    _v = pd.to_numeric(base_for_lab["qtyRunner"], errors="coerce").dropna()
+    if len(_v):
+        _m = _v.mode()
+        _default_runner = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
+        _default_runner = max(0, _default_runner)
+
 with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) — mismo trade, distinto tamaño", expanded=False):
     split_enable = st.checkbox(
         "✨ Activar magia de contratos",
         key="split_enable",
         help=("Simula cómo habría cambiado tu PnL/DD/PF si hubieras usado otra cantidad de contratos en TP1 y Runner, "
-              "sin cambiar entradas ni salidas. "
-              "Ejemplo: TP1=9, Runner=1 (total 10).")
+              "sin cambiar entradas ni salidas. Ejemplo: TP1=9, Runner=1 (total 10).")
     )
 
-    # Defaults from dataset (mode/median) to match your usual setup (e.g., 3 TP1 + 2 Runner)
-    _default_tp1 = 3
-    _default_runner = 2
-
-    if "qtyTP1" in base_for_lab.columns:
-        _v = pd.to_numeric(base_for_lab["qtyTP1"], errors="coerce").dropna()
-        if len(_v):
-            _m = _v.mode()
-            _default_tp1 = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
-            _default_tp1 = max(0, _default_tp1)
-
-    if "qtyRunner" in base_for_lab.columns:
-        _v = pd.to_numeric(base_for_lab["qtyRunner"], errors="coerce").dropna()
-        if len(_v):
-            _m = _v.mode()
-            _default_runner = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
-            _default_runner = max(0, _default_runner)
-
-    # Initialize settings when enabling (avoid stale session_state after loading new files)
-    if split_enable and not st.session_state.get("_split_inited", False):
-        st.session_state["split_tp1"] = int(st.session_state.get("split_tp1", _default_tp1))
-        st.session_state["split_runner"] = int(st.session_state.get("split_runner", _default_runner))
-        st.session_state["split_total"] = int(st.session_state["split_tp1"] + st.session_state["split_runner"])
-        st.session_state["_split_inited"] = True
-        _st_rerun()
-
-    if (not split_enable) and st.session_state.get("_split_inited", False):
-        st.session_state["_split_inited"] = False
-
     if split_enable:
+        # Botón para volver a tu split típico (evita 'session_state' viejo al cargar archivos nuevos)
+        if st.button("🔄 Reset magia (volver a split típico)", key="split_reset"):
+            st.session_state["split_tp1"] = int(_default_tp1)
+            st.session_state["split_runner"] = int(_default_runner)
+            st.session_state["split_total"] = int(max(1, _default_tp1 + _default_runner))
+            _st_rerun()
+
         cA, cB, cC = st.columns([1, 1, 1])
         with cA:
-            tp1_c = st.number_input(
+            st.number_input(
                 "🎯 Contratos en TP1",
                 min_value=0, max_value=200,
                 value=int(st.session_state.get("split_tp1", _default_tp1)),
@@ -3142,7 +3114,7 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
                 help="Cuántos contratos quieres asignar al TP1 en el what-if."
             )
         with cB:
-            run_c = st.number_input(
+            st.number_input(
                 "🏃‍♂️ Contratos Runner",
                 min_value=0, max_value=200,
                 value=int(st.session_state.get("split_runner", _default_runner)),
@@ -3150,12 +3122,13 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
                 key="split_runner",
                 help="Cuántos contratos quieres dejar como runner."
             )
-        total_c = int(tp1_c + run_c)
+        _tp1_ui = int(st.session_state.get("split_tp1", 0) or 0)
+        _run_ui = int(st.session_state.get("split_runner", 0) or 0)
+        _tot_ui = int(max(1, _tp1_ui + _run_ui))
         with cC:
-            st.metric("🧮 Total contratos", f"{max(1, total_c)}")
+            st.metric("🧮 Total contratos", f"{_tot_ui}")
 
-        # Persist a clean total (used in report)
-        st.session_state["split_total"] = int(max(1, total_c))
+        st.session_state["split_total"] = int(_tot_ui)
 
         st.caption(
             f"Tu split típico en esta muestra parece ser **TP1={_default_tp1} / Runner={_default_runner}** "
@@ -3169,6 +3142,27 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
                 f"🔎 Trades con **TRAIL** (donde el split impacta más) en esta muestra: **{_trail_n}**. "
                 "En SL/BE normalmente se escala por contrato."
             )
+    else:
+        st.caption("Modo mago apagado: la simulación usa tus PnL reales (sin re-escalar por contratos).")
+
+split_enabled = bool(st.session_state.get("split_enable", False))
+if split_enabled:
+    tp1_c = int(st.session_state.get("split_tp1", _default_tp1) or 0)
+    run_c = int(st.session_state.get("split_runner", _default_runner) or 0)
+    filtered = apply_split_tp1_runner(
+        filtered_raw,
+        tp1_contracts=tp1_c,
+        runner_contracts=run_c,
+    )
+else:
+    filtered = filtered_raw
+
+# Mostrar conteo/estado SIEMPRE (con o sin modo mago)
+st.write(f"Trades tras filtros: **{len(filtered)}** (de {len(base_for_lab)})")
+if filter_notes:
+    st.caption("Filtros activos: " + ", ".join(filter_notes))
+else:
+    st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
 
 # Simulación
 if filtered is None or filtered.empty:
@@ -3217,17 +3211,20 @@ else:
     c4.metric("PnL simulado ($)", f"{pnl_sim:.0f}", delta=f"{(pnl_sim - pnl_real):.0f}")
     c5.metric("PF real / sim", f"{fmt(pf_real,2)} / {fmt(pf_sim,2)}")
 
-if split_enabled:
-    _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
-    _run = int(st.session_state.get("split_runner", 0) or 0)
-    _tot = int(max(1, _tp1 + _run))
-    if pnl_sim_base is not None:
-        st.caption(
-            f"🧙‍♂️ Modo Mago activo: total={_tot} | TP1={_tp1} | runner={_run}  ·  "
-            f"PnL sim(sin magia)={pnl_sim_base:.0f} → PnL sim(magia)={pnl_sim:.0f} (Δ {(pnl_sim - pnl_sim_base):.0f})  ·  "
-            f"PF sim(sin magia)={fmt(pf_sim_base,2)} → PF sim(magia)={fmt(pf_sim,2)}"
-        )
+if ('real_df' in locals()) and ('sim_df' in locals()) and ('n_real' in locals()):
+    # Extra: si el modo mago está activo, muestra comparación contra el baseline (sin magia)
+    if split_enabled:
+        _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
+        _run = int(st.session_state.get("split_runner", 0) or 0)
+        _tot = int(max(1, _tp1 + _run))
+        if pnl_sim_base is not None:
+            st.caption(
+                f"🧙‍♂️ Modo Mago activo: total={_tot} | TP1={_tp1} | runner={_run}  ·  "
+                f"PnL sim(sin magia)={pnl_sim_base:.0f} → PnL sim(magia)={pnl_sim:.0f} (Δ {(pnl_sim - pnl_sim_base):.0f})  ·  "
+                f"PF sim(sin magia)={fmt(pf_sim_base,2)} → PF sim(magia)={fmt(pf_sim,2)}"
+            )
 
+    # Métricas auxiliares (SIEMPRE visibles)
     d1, d2, d3 = st.columns(3)
     d1.metric("Omitidos por filtros", f"{omit_filtros}")
     d2.metric("Omitidos por reglas", f"{omit_reglas}")
@@ -3237,7 +3234,12 @@ if split_enabled:
     # Drawdown (aprox) por curva de equity
     def _equity_df(df_):
         z = df_.copy()
-        z = z.sort_values("exit_time" if "exit_time" in z.columns else "entry_time")
+        time_col = "exit_time" if "exit_time" in z.columns else ("entry_time" if "entry_time" in z.columns else None)
+        if time_col:
+            z = z[z[time_col].notna()].sort_values(time_col)
+            z["__t"] = z[time_col]
+        else:
+            z["__t"] = pd.RangeIndex(len(z))
         z["equity"] = z["tradeRealized"].fillna(0).cumsum()
         z["equity_peak"] = z["equity"].cummax()
         z["drawdown"] = z["equity"] - z["equity_peak"]
@@ -3258,7 +3260,7 @@ if split_enabled:
                "Por eso puede tener menos trades que lo real. Para que coincida 1:1, deja filtros en 'todo' y reglas en 0.")
 
     # ------------------------------------------------------------
-    # 📄 Exportar reporte (PDF) — filtros + resultados
+    # 📄 Exportar reporte (PDF/HTML) — filtros + resultados
     # ------------------------------------------------------------
     cfg_lines = []
     cfg_lines.append(f"Máx pérdida/día: {max_loss:.0f}" if max_loss > 0 else "Máx pérdida/día: sin límite")
@@ -3270,12 +3272,19 @@ if split_enabled:
     if stop_big_win:
         cfg_lines.append("Stop por ganador grande (RR ≥ 2)")
 
-# Add split settings to report
-if split_enabled:
-    _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
-    _run = int(st.session_state.get("split_runner", 0) or 0)
-    _tot = int(max(1, _tp1 + _run))
-    cfg_lines.append(f"Modo Mago (contratos): total={_tot} | TP1={_tp1} | runner={_run}")
+    # Add split settings to report (si aplica)
+    lab_filters_dict = _collect_filter_settings("lab_")
+    if split_enabled:
+        _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
+        _run = int(st.session_state.get("split_runner", 0) or 0)
+        _tot = int(max(1, _tp1 + _run))
+        cfg_lines.append(f"Modo Mago (contratos): total={_tot} | TP1={_tp1} | runner={_run}")
+        lab_filters_dict.update({
+            "split_enabled": True,
+            "split_total": _tot,
+            "split_tp1": _tp1,
+            "split_runner": _run,
+        })
 
     pdf_metrics = {
         "Trades reales": n_real,
@@ -3322,18 +3331,7 @@ if split_enabled:
             "Ejemplo: `reportlab>=4.0`\n\n"
             "Mientras tanto, puedes descargar un reporte en **HTML** (imprimible) abajo."
         )
-        
-        lab_filters_dict = _collect_filter_settings("lab_")
-        if split_enabled:
-            _tp1 = int(st.session_state.get("split_tp1", 0) or 0)
-            _run = int(st.session_state.get("split_runner", 0) or 0)
-            _tot = int(max(1, _tp1 + _run))
-            lab_filters_dict.update({
-                "split_enabled": True,
-                "split_total": _tot,
-                "split_tp1": _tp1,
-                "split_runner": _run,
-            })
+
         html = build_resultlab_html(
             title="ResultLab — Reporte",
             global_filters=gf_dict if 'gf_dict' in globals() else {},
@@ -3351,20 +3349,21 @@ if split_enabled:
             help="Abre el HTML y usa Imprimir → Guardar como PDF si lo necesitas."
         )
 
-
-    # Equity curve
+    # Equity curve (SIEMPRE visible)
     st.markdown("#### Curva de equity (real vs simulado)")
-    if len(real_eq) and len(sim_eq) and ("exit_time" in real_eq.columns) and ("exit_time" in sim_eq.columns):
-        real_plot = real_eq[["exit_time","equity"]].rename(columns={"equity":"Equity real"})
-        sim_plot  = sim_eq[["exit_time","equity"]].rename(columns={"equity":"Equity sim"})
-        plot_df = pd.merge_asof(real_plot.sort_values("exit_time"),
-                                sim_plot.sort_values("exit_time"),
-                                on="exit_time", direction="nearest", tolerance=pd.Timedelta("1D"))
-        plot_df = plot_df.sort_values("exit_time")
-        fig = px.line(plot_df, x="exit_time", y=["Equity real","Equity sim"], title="Equity ($)")
+    if len(real_eq) and len(sim_eq):
+        # Preferimos '__t' construido arriba
+        real_plot = real_eq[["__t","equity"]].rename(columns={"equity":"Equity real"})
+        sim_plot  = sim_eq[["__t","equity"]].rename(columns={"equity":"Equity sim"})
+        plot_df = pd.merge_asof(real_plot.sort_values("__t"),
+                                sim_plot.sort_values("__t"),
+                                on="__t", direction="nearest", tolerance=pd.Timedelta("1D") if isinstance(real_plot["__t"].iloc[0], pd.Timestamp) else None)
+        plot_df = plot_df.sort_values("__t")
+        fig = px.line(plot_df, x="__t", y=["Equity real","Equity sim"], title="Equity ($)")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No hay datos suficientes para comparar curvas de equity.")
+
 # Impacto de las reglas (en vez de solo frecuencia)
     if stops_df is not None and not stops_df.empty:
         st.markdown("#### ¿Qué regla detuvo el día y qué impacto tuvo?")
