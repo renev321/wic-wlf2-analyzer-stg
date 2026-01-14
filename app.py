@@ -3337,19 +3337,28 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
 
         res = st.session_state.get("goal_search_res", None)
         if isinstance(res, pd.DataFrame) and not res.empty:
-            hit_n = int(res["Hit"].sum()) if "Hit" in res.columns else 0
+            # Keep ONLY valid combos: PnL >= goal AND MaxDD <= goal (no "near misses" by default)
+            if "Hit" in res.columns:
+                res_hits = res[res["Hit"] == True].copy()
+            else:
+                res_hits = res.copy()
+
+            hit_n = int(len(res_hits))
+
             if hit_n > 0:
                 st.success(
                     f"Encontrados {hit_n} combos que cumplen: PnL ≥ {goal_pnl:.0f} y MaxDD ≤ {goal_dd:.0f}."
                 )
+
+                show_cols = ["TP1", "Runner", "Total", "PnL_sim", "MaxDD_sim", "PF_sim", "Trades_sim", "DaysCut", "Hit"]
+                show_cols = [c for c in show_cols if c in res_hits.columns]
+                st.dataframe(res_hits[show_cols].head(200), use_container_width=True)
             else:
                 st.warning(
-                    "No se encontraron combos que cumplan ambos objetivos. Te muestro los más cercanos."
+                    "No se encontraron combos que cumplan ambos objetivos (PnL y MaxDD). "
+                    "Prueba ampliar el rango de búsqueda o ajustar las metas."
                 )
-
-            show_cols = ["TP1", "Runner", "Total", "PnL_sim", "MaxDD_sim", "PF_sim", "Trades_sim", "DaysCut", "Hit"]
-            show_cols = [c for c in show_cols if c in res.columns]
-            st.dataframe(res[show_cols].head(60), use_container_width=True)
+                # We intentionally do NOT show 'near misses' to avoid suggesting invalid combos.
 
             try:
                 _sc = res.head(250).copy()
