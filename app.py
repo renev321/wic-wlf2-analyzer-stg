@@ -19,6 +19,21 @@ except ModuleNotFoundError:
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
+# --- Streamlit rerun helper (compatible across versions) ---
+def _st_rerun():
+    # Newer Streamlit: st.rerun(); Older: st.experimental_rerun()
+    fn = getattr(st, "rerun", None)
+    if callable(fn):
+        fn()
+    else:
+        fn2 = getattr(st, "experimental_rerun", None)
+        if callable(fn2):
+            fn2()
+        else:
+            # As a last resort, do nothing (avoid crashing)
+            return
+
+
 def _best_group_for_categorical(df: pd.DataFrame, col: str, min_trades: int):
     if col not in df.columns:
         return None
@@ -1320,7 +1335,7 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
                 ss["gf_months"] = month_opts
                 ss["gf_weekdays"] = weekday_en
                 ss["gf_dom_min"], ss["gf_dom_max"] = 1, 31
-                st.experimental_rerun()
+                _st_rerun()
 
         r2c1, r2c2, r2c3 = st.columns([2,2,2])
         with r2c1:
