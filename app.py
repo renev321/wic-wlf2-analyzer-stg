@@ -1547,11 +1547,30 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 # What-if sizing: simulate different TP1 vs Runner contract split
 # (No scaling-in. Same trade path, just different quantity allocation.)
 # ============================================================
-def apply_split_tp1_runner(df: pd.DataFrame, total_contracts: int, tp1_contracts: int):
+def apply_split_tp1_runner(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    tp1_pct: float = 60.0,
+    fixed_total_contracts: int = 5,
+    fixed_tp1_contracts: int = 3,
+):
     """Return a copy of df with tradeRealized adjusted for a what-if split between TP1 and Runner.
 
+    This is a *what-if* reallocation of the SAME trade into TP1 vs Runner sizes.
+    It does NOT simulate scale-in / adding contracts mid-trade.
+
+    Parameters
+    ----------
+    mode:
+        - "keep_original_total": keep each trade's original total contracts (qty_total) and reallocate by tp1_pct.
+          This is the safest default and ensures that if tp1_pct matches the dataset's typical split,
+          results remain identical when you enable the feature.
+        - "fixed_total": force a single total contract size for every trade (fixed_total_contracts),
+          then allocate TP1 vs Runner using fixed_tp1_contracts.
+
     Assumptions based on your current log schema:
-    - qtyTP1 / qtyRunner are the ORIGINAL sizes used in the trade.
+    - qtyTP1 / qtyRunner are the ORIGINAL sizes used in the trade (coming from ENTRY merge).
     - exitReason == 'TRAIL' implies TP1 was filled and the runner exited later (trail).
       For other exitReason values (SL/BE/SESSION_END), TP1 did not fill in your current behavior,
       so all contracts are assumed to exit the same way (split does not change per-contract outcome).
@@ -1559,18 +1578,97 @@ def apply_split_tp1_runner(df: pd.DataFrame, total_contracts: int, tp1_contracts
     if df is None or df.empty:
         return df
 
-    total_contracts = int(max(1, total_contracts))
-    tp1_contracts = int(max(0, min(tp1_contracts, total_contracts)))
-    runner_contracts = int(total_contracts - tp1_contracts)
-
     z = df.copy()
-
-    # Keep original for reporting/debug
-    if "tradeRealized" in z.columns:
-        z["tradeRealized_orig"] = z["tradeRealized"]
-    else:
+    if "tradeRealized" not in z.columns:
         return z
 
+    # --- Original totals (per trade) ---
+    if "qty_total" in z.columns:
+        qtot = pd.to_numeric(z["qty_total"], errors="coerce")
+    else:
+        # fall back to qtyTP1 + qtyRunner if present
+        q1o = pd.to_numeric(z.get("qtyTP1", np.nan), errors="coerce")
+        qro = pd.to_numeric(z.get("qtyRunner", np.nan), errors="coerce")
+        qtot = q1o.fillna(0) + qro.fillna(0)
+
+    # --- Choose simulated totals (per trade) + allocation ---
+    mode = (mode or "").strip().lower()
+    if mode == "fixed_total":
+        total_new = pd.Series(int(max(1, fixed_total_contracts)), index=z.index, dtype="float")
+        tp1_new = pd.Series(int(max(0, min(fixed_tp1_contracts, int(max(1, fixed_total_contracts))))),
+                            index=z.index, dtype="float")
+    else:
+        # keep_original_total (default)
+        pct = float(tp1_pct) / 100.0
+        total_new = qtot.copy()
+        # If some rows miss totals, fallback to fixed_total_contracts
+        total_new = total_new.where(np.isfinite(total_new) & (total_new > 0), float(max(1, fixed_total_contracts)))
+        tp1_new = np.round(total_new * pct)
+
+    # clamp tp1 within [0, total]
+    tp1_new = tp1_new.where(np.isfinite(tp1_new), 0.0)
+    tp1_new = tp1_new.clip(lower=0.0)
+    tp1_new = np.minimum(tp1_new, total_new)
+    runner_new = (total_new - tp1_new).clip(lower=0.0)
+
+    # Keep originals untouched for debugging
+    z["tradeRealized_orig"] = z["tradeRealized"]
+
+    # Tick value (USD per tick per 1 contract)
+    if "tick_value" not in z.columns:
+        if "tickSize" in z.columns and "pointValue" in z.columns:
+            z["tick_value"] = pd.to_numeric(z["tickSize"], errors="coerce") * pd.to_numeric(z["pointValue"], errors="coerce")
+        else:
+            z["tick_value"] = np.nan
+
+    tv = pd.to_numeric(z["tick_value"], errors="coerce")
+    tr = pd.to_numeric(z["tradeRealized_orig"], errors="coerce")
+    ticks_total = tr / tv
+
+    # Base per-contract outcome (used when TP1 did NOT fill)
+    per_contract = np.where((qtot > 0) & np.isfinite(ticks_total), ticks_total / qtot, np.nan)
+
+    # TRAIL trades: infer runner ticks from original split
+    q1 = pd.to_numeric(z.get("qtyTP1", 0), errors="coerce").fillna(0)
+    qr = pd.to_numeric(z.get("qtyRunner", 0), errors="coerce").fillna(0)
+    tp1_ticks = pd.to_numeric(z.get("tp1Ticks", np.nan), errors="coerce")
+
+    exit_reason = z.get("exitReason", pd.Series([None]*len(z)))
+    is_trail = exit_reason.astype(str).str.upper().eq("TRAIL")
+
+    runner_ticks = np.where(
+        (is_trail) & (qr > 0) & np.isfinite(ticks_total) & np.isfinite(tp1_ticks),
+        (ticks_total - (q1 * tp1_ticks)) / qr,
+        np.nan
+    )
+
+    # Simulated ticks total
+    sim_ticks = np.where(
+        is_trail & np.isfinite(runner_ticks) & np.isfinite(tp1_ticks),
+        (tp1_new * tp1_ticks) + (runner_new * runner_ticks),
+        per_contract * total_new
+    )
+
+    sim_realized = sim_ticks * tv
+
+    # Fallback: if something is missing, scale original PnL by (newTotal/origTotal)
+    scale = np.where((qtot > 0) & np.isfinite(qtot), total_new / qtot, 1.0)
+    sim_realized = np.where(np.isfinite(sim_realized), sim_realized, tr * scale)
+
+    # If chosen allocation matches original exactly (for rows with known originals), keep exact original PnL
+    same_total = np.isfinite(qtot) & (np.round(total_new) == np.round(qtot))
+    same_tp1 = np.isfinite(q1) & (np.round(tp1_new) == np.round(q1))
+    same_runner = np.isfinite(qr) & (np.round(runner_new) == np.round(qr))
+    same_all = same_total & same_tp1 & same_runner
+    sim_realized = np.where(same_all, tr, sim_realized)
+
+    z["tradeRealized"] = sim_realized
+    z["split_total"] = total_new
+    z["split_tp1"] = tp1_new
+    z["split_runner"] = runner_new
+    z["split_mode"] = np.where(is_trail, "TRAIL(tp1+runner)", "NO_TP1(all-exit)")
+    z["split_cfg"] = mode
+    return z
     # Ensure tick_value exists
     if "tick_value" not in z.columns:
         if "tickSize" in z.columns and "pointValue" in z.columns:
@@ -3042,9 +3140,23 @@ with lab_right:
     # --- What-if: simulate different TP1 vs Runner contract split (no scale-in) ---
     split_enabled = bool(st.session_state.get("split_enable", False))
     if split_enabled:
-        total_c = int(st.session_state.get("split_total", 1) or 1)
-        tp1_c = int(st.session_state.get("split_tp1", 0) or 0)
-        filtered = apply_split_tp1_runner(filtered_raw, total_c, tp1_c)
+        mode = str(st.session_state.get("split_cfg_mode", "keep_original_total") or "keep_original_total")
+        if mode == "fixed_total":
+            total_c = int(st.session_state.get("split_total", 1) or 1)
+            tp1_c = int(st.session_state.get("split_tp1", 0) or 0)
+            filtered = apply_split_tp1_runner(
+                filtered_raw,
+                mode="fixed_total",
+                fixed_total_contracts=total_c,
+                fixed_tp1_contracts=tp1_c
+            )
+        else:
+            tp1_pct = float(st.session_state.get("split_tp1_pct", 60.0) or 60.0)
+            filtered = apply_split_tp1_runner(
+                filtered_raw,
+                mode="keep_original_total",
+                tp1_pct=tp1_pct
+            )
     else:
         filtered = filtered_raw
 
@@ -3058,51 +3170,97 @@ with lab_right:
     # 🧮 What-if: split contratos TP1 vs Runner (sin scale-in)
     # ------------------------------------------------------------
     with st.expander("🧮 What-if: Split contratos TP1 vs Runner (sin cambiar entradas/exits)", expanded=False):
-        st.checkbox("Activar simulación de split", key="split_enable",
-                    help="Simula cómo habría cambiado el PnL si repartes los contratos entre TP1 y Runner de otra forma, "
-                         "sin cambiar el comportamiento del trade (sin scale-in).")
+        split_enable = st.checkbox(
+            "Activar simulación de split",
+            key="split_enable",
+            help=("Simula cómo habría cambiado el PnL si repartes los contratos entre TP1 y Runner de otra forma, "
+                  "sin cambiar el comportamiento del trade (sin scale-in). "
+                  "Por defecto mantiene el total original por trade, para que al activarlo NO cambie nada si el split coincide.")
+        )
 
-        if bool(st.session_state.get("split_enable", False)):
-            # Defaults from dataset (mode -> median -> 1)
-            _default_total = 1
-            if "qty_total" in base_for_lab.columns:
-                _v = pd.to_numeric(base_for_lab["qty_total"], errors="coerce").dropna()
-                if len(_v):
-                    _m = _v.mode()
-                    _default_total = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
-                    _default_total = max(1, _default_total)
+        # Defaults from dataset (mode -> median -> 60%)
+        _default_total = 5
+        _default_tp1 = 3
+        _default_pct = 60.0
 
-            _default_tp1 = 0
-            if "qtyTP1" in base_for_lab.columns:
-                _v2 = pd.to_numeric(base_for_lab["qtyTP1"], errors="coerce").dropna()
-                if len(_v2):
-                    _m2 = _v2.mode()
-                    _default_tp1 = int(_m2.iloc[0]) if len(_m2) else int(round(float(_v2.median())))
-                    _default_tp1 = max(0, _default_tp1)
+        if "qty_total" in base_for_lab.columns:
+            _v = pd.to_numeric(base_for_lab["qty_total"], errors="coerce").dropna()
+            if len(_v):
+                _m = _v.mode()
+                _default_total = int(_m.iloc[0]) if len(_m) else int(round(float(_v.median())))
+                _default_total = max(1, _default_total)
 
-            total_c = st.number_input(
-                "Total contratos (TP1 + Runner)",
-                min_value=1, max_value=50,
-                value=int(st.session_state.get("split_total", _default_total)),
-                step=1,
-                key="split_total",
-                help="Mantén esto fijo si solo quieres cambiar el reparto TP1 vs Runner."
+        if "qtyTP1" in base_for_lab.columns:
+            _v2 = pd.to_numeric(base_for_lab["qtyTP1"], errors="coerce").dropna()
+            if len(_v2):
+                _m2 = _v2.mode()
+                _default_tp1 = int(_m2.iloc[0]) if len(_m2) else int(round(float(_v2.median())))
+                _default_tp1 = max(0, _default_tp1)
+
+        if _default_total > 0:
+            _default_pct = float(np.clip((_default_tp1 / float(_default_total)) * 100.0, 0.0, 100.0))
+
+        # Initialize split settings the first time you enable it (avoids stale session_state values)
+        if split_enable and not st.session_state.get("_split_inited", False):
+            st.session_state["split_cfg_mode"] = "keep_original_total"
+            st.session_state["split_tp1_pct"] = float(st.session_state.get("split_tp1_pct", _default_pct))
+            st.session_state["split_total"] = int(st.session_state.get("split_total", _default_total))
+            st.session_state["split_tp1"] = int(st.session_state.get("split_tp1", _default_tp1))
+            st.session_state["_split_inited"] = True
+            _st_rerun()
+        if (not split_enable) and st.session_state.get("_split_inited", False):
+            st.session_state["_split_inited"] = False
+
+        if split_enable:
+            mode = st.radio(
+                "Modo de simulación",
+                options=["Mantener total original por trade (recomendado)", "Forzar total fijo para todos los trades"],
+                index=0 if st.session_state.get("split_cfg_mode", "keep_original_total") != "fixed_total" else 1,
+                key="split_cfg_mode_ui",
+                help=("Recomendado: mantiene el mismo total de contratos de cada trade y solo cambia el reparto TP1/Runner. "
+                      "Esto asegura que si el split por defecto coincide, activar NO cambia nada.")
             )
-            tp1_c = st.slider(
-                "Contratos en TP1",
-                min_value=0, max_value=int(total_c),
-                value=int(min(st.session_state.get("split_tp1", _default_tp1), total_c)),
-                step=1,
-                key="split_tp1"
-            )
-            runner_c = int(total_c - tp1_c)
-            st.caption(f"Runner = **{runner_c}** contratos.")
+            if mode.startswith("Forzar"):
+                st.session_state["split_cfg_mode"] = "fixed_total"
+            else:
+                st.session_state["split_cfg_mode"] = "keep_original_total"
+
+            if st.session_state["split_cfg_mode"] == "keep_original_total":
+                tp1_pct = st.slider(
+                    "TP1 % del total (Runner = 100% - TP1%)",
+                    min_value=0, max_value=100,
+                    value=int(round(float(st.session_state.get("split_tp1_pct", _default_pct)))),
+                    step=1,
+                    key="split_tp1_pct"
+                )
+                st.caption(f"Split actual típico del dataset: **{_default_tp1}/{_default_total}** (~{_default_pct:.0f}% TP1).")
+            else:
+                total_c = st.number_input(
+                    "Total contratos (TP1 + Runner)",
+                    min_value=1, max_value=50,
+                    value=int(st.session_state.get("split_total", _default_total)),
+                    step=1,
+                    key="split_total",
+                    help="Este modo cambia el tamaño total del trade (what-if de sizing) además del reparto."
+                )
+                tp1_c = st.slider(
+                    "Contratos en TP1",
+                    min_value=0, max_value=int(total_c),
+                    value=int(min(st.session_state.get("split_tp1", _default_tp1), total_c)),
+                    step=1,
+                    key="split_tp1"
+                )
+                runner_c = int(total_c - tp1_c)
+                st.caption(f"Runner = **{runner_c}** contratos.")
 
             # Info útil: en tus logs actuales, el split solo impacta trades TRAIL (cuando TP1 se ejecutó)
             if "exitReason" in filtered_raw.columns:
                 _trail_n = int(filtered_raw["exitReason"].astype(str).str.upper().eq("TRAIL").sum())
-                st.caption(f"En esta muestra, trades con **TRAIL** (TP1 ejecutado) = **{_trail_n}**. "
-                           "En SL/BE, TP1 no se ejecutó en tus logs actuales, así que el split casi no cambia nada.")
+                st.caption(
+                    f"En esta muestra, trades con **TRAIL** (TP1 ejecutado) = **{_trail_n}**. "
+                    "En SL/BE, TP1 no se ejecutó en tus logs actuales, así que el split casi no cambia nada."
+                )
+
 # Simulación
 if filtered is None or filtered.empty:
     st.info("Con los filtros actuales no quedan trades para simular.")
