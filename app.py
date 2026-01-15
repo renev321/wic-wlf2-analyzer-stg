@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import math
 import json
 import plotly.express as px
 
@@ -2117,10 +2118,16 @@ try:
         _ds_sig = (int(len(t_all)), str(_dmin0), str(_dmax0), int(bad_total))
         if st.session_state.get("dataset_sig") != _ds_sig:
             st.session_state["dataset_sig"] = _ds_sig
-            # Global date filter widgets (sección de arriba)
-            st.session_state["gf_year_rng"] = (int(_dmin0.year), int(_dmax0.year))
-            st.session_state["gf_month_rng"] = (1, 12)
-            st.session_state["gf_d_range"] = (_dmin0, _dmax0)
+            # Reset global date filter widgets to FULL range for the new dataset
+            st.session_state["gf_d_from"] = _dmin0
+            st.session_state["gf_d_to"]   = _dmax0
+            st.session_state["gf_year_min"] = int(_dmin0.year)
+            st.session_state["gf_year_max"] = int(_dmax0.year)
+            st.session_state["gf_dom_min"] = 1
+            st.session_state["gf_dom_max"] = 31
+            st.session_state["gf_months"] = list(range(1, 13))
+            st.session_state["gf_weekdays"] = [x[0] for x in _ES_WEEKDAY_ORDER]
+
             # Daily PnL/DD chart (zoom local)
             st.session_state["daily_use_global"] = True
             st.session_state["daily_zoom"] = "Auto"
@@ -2800,6 +2807,12 @@ def _apply_filters(df_in: pd.DataFrame):
 
     # --- helper UI: slider rango basado en min/max del dataset ---
     def _range_slider_for(col: str, key: str, title: str, unit_hint: str = "", fixed_step: float | None = None):
+        """
+        Range slider helper.
+
+        If fixed_step is provided (e.g. TickSize=0.25), we expand slider bounds to a clean grid
+        so you can select exact thresholds (e.g. 39.75) even if the dataset's min is 40.08.
+        """
         if col not in df.columns:
             return None
         lo0, hi0 = _finite_minmax(df[col])
@@ -2810,44 +2823,51 @@ def _apply_filters(df_in: pd.DataFrame):
         if hi0 < lo0:
             lo0, hi0 = hi0, lo0
 
-        # default: rango completo (no filtra)
-        default = st.session_state.get(key, (lo0, hi0))
-        try:
-            default = (float(default[0]), float(default[1]))
-        except Exception:
-            default = (lo0, hi0)
-
-        # step: si nos dan un paso fijo (p.ej. TickSize), lo respetamos
+        # step (prefer fixed_step = TickSize)
+        step = None
         if fixed_step is not None:
             try:
                 step = float(fixed_step)
             except Exception:
                 step = None
-        else:
-            step = None
 
         if step is None or step <= 0:
             step = max((hi0 - lo0) / 200.0, 0.01)
-        # evitar steps raros
         if (hi0 - lo0) > 0 and step > (hi0 - lo0):
             step = (hi0 - lo0)
 
-        # Snap del default al grid del step para poder elegir valores exactos (p.ej. 40.00, 40.25, 40.50...)
+        # expand bounds to a step grid (1 step below/above)
+        slider_lo, slider_hi = lo0, hi0
+        if step and step > 0:
+            try:
+                slider_lo = math.floor(lo0 / step) * step - step
+                slider_hi = math.ceil(hi0 / step) * step + step
+            except Exception:
+                slider_lo, slider_hi = lo0, hi0
+
+        # default: full range (no filter)
+        default = st.session_state.get(key, (slider_lo, slider_hi))
+        try:
+            default = (float(default[0]), float(default[1]))
+        except Exception:
+            default = (slider_lo, slider_hi)
+
+        # snap default to grid (origin = slider_lo)
         if step and step > 0:
             def _snap(x: float) -> float:
                 try:
-                    return float(round((x - lo0) / step) * step + lo0)
+                    return float(round((x - slider_lo) / step) * step + slider_lo)
                 except Exception:
                     return x
             default = (_snap(default[0]), _snap(default[1]))
-            # clamp + orden
-            a = min(max(default[0], lo0), hi0)
-            b = min(max(default[1], lo0), hi0)
+            a = min(max(default[0], slider_lo), slider_hi)
+            b = min(max(default[1], slider_lo), slider_hi)
             default = (a, b) if a <= b else (b, a)
 
         label = f"{title}" + (f" ({unit_hint})" if unit_hint else "")
-        rng = st.slider(label, lo0, hi0, default, step=step, key=key)
+        rng = st.slider(label, slider_lo, slider_hi, default, step=step, key=key)
         return rng
+
     # --- helper: aplicar rango inclusivo (con opción de incluir NaN) ---
     def _apply_range_mask(dfx: pd.DataFrame, col: str, rng):
         if col not in dfx.columns or rng is None:
@@ -3026,7 +3046,8 @@ def _simulate_daily_rules(df: pd.DataFrame,
                           max_trades: int = 0,
                           max_consec_losses: int = 0,
                           stop_big_loss: bool = False,
-                          stop_big_win: bool = False):
+                          stop_big_win: bool = False,
+                          use_log_daily_halt: bool = True):
     """Simula reglas diarias sobre un DataFrame de trades.
 
     Devuelve:
@@ -3079,6 +3100,49 @@ def _simulate_daily_rules(df: pd.DataFrame,
 
     kept_idx = []
     stop_rows = []
+
+    # Si el log ya trae 'dailyHalt' (corte real del robot), podemos reproducirlo EXACTO.
+    # Esto es ideal para validar: "mi JSON vs el Lab" sin que haya discrepancias por interpretación.
+    # OJO: si cambias las reglas (max_loss/max_profit/etc) o usas Modo Mago (reescalado), desactívalo.
+    if use_log_daily_halt and "dailyHalt" in with_time.columns:
+        def _to_bool(v) -> bool:
+            if isinstance(v, bool):
+                return v
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return False
+            s = str(v).strip().lower()
+            return s in ("true", "1", "yes", "y", "t")
+
+        for day, g in with_time.groupby("day", sort=False):
+            g = g.sort_values(time_col)
+            halt_mask = g["dailyHalt"].apply(_to_bool).to_numpy()
+            if halt_mask.any():
+                first_pos = int(np.where(halt_mask)[0][0])
+                keep = g.iloc[: first_pos + 1]
+                omit = g.iloc[first_pos + 1 :]
+                kept_idx.extend(keep.index.tolist())
+                if len(omit) > 0:
+                    stop_rows.append({
+                        "day": day,
+                        "motivo": "Corte del log (dailyHalt)",
+                        "trades_omitidos": int(len(omit)),
+                    })
+            else:
+                kept_idx.extend(g.index.tolist())
+
+        kept_df = with_time.loc[kept_idx].copy()
+        # Agregar trades sin timestamp (no se pueden cortar por día)
+        if not no_time.empty:
+            kept_df = pd.concat([kept_df, no_time], ignore_index=False)
+
+        if time_col in kept_df.columns:
+            try:
+                kept_df = kept_df.sort_values(time_col)
+            except Exception:
+                pass
+
+        stops_df = pd.DataFrame(stop_rows)
+        return kept_df, stops_df
 
     # Prioridad cuando varias reglas se disparan en el mismo trade
     def _pick_motivo(candidates):
@@ -3187,6 +3251,7 @@ def _reset_lab_state(base_df: pd.DataFrame):
     st.session_state["lab_max_consec_losses"] = 0
     st.session_state["lab_stop_big_loss"] = False
     st.session_state["lab_stop_big_win"] = False
+    st.session_state["lab_use_log_daily_halt"] = True
 
     # -------------------- Helpers --------------------
     def _minmax(col: str, default=(0.0, 1.0)):
@@ -3289,6 +3354,20 @@ with lab_left:
                                 key="lab_stop_big_loss")
     stop_big_win = st.checkbox("Cortar el día tras un ganador grande (RR ≥ 2)", value=bool(st.session_state.get("lab_stop_big_win", False)),
                                key="lab_stop_big_win")
+
+
+    # --- Comparación 1:1 (validación) ---
+    # Si está activo y el dataset trae la columna dailyHalt, el simulador NO recalcula el corte por MaxLoss/MaxProfit:
+    # reproduce exactamente dónde tu robot cortó el día en el log. Útil para validar que el Lab coincide con tu replay.
+    use_log_daily_halt = st.checkbox(
+        "Usar cortes del log (dailyHalt) para comparar 1:1",
+        value=bool(st.session_state.get("lab_use_log_daily_halt", True)),
+        key="lab_use_log_daily_halt",
+        help=(
+            "Recomendado para validación (mismo JSON): el Lab cortará días EXACTAMENTE donde el log dice dailyHalt=True. "
+            "Si vas a hacer what-if (cambiar reglas o Modo Mago), apágalo para que el simulador recalculé los cortes."
+        ),
+    )
 
 
     st.markdown("---")
@@ -3577,6 +3656,7 @@ else:
     st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
 
 # Simulación
+use_log_daily_halt = bool(st.session_state.get("lab_use_log_daily_halt", True))
 if filtered is None or filtered.empty:
     st.info("Con los filtros actuales no quedan trades para simular.")
 else:
@@ -3587,11 +3667,11 @@ else:
     pf_sim_base = None
     if split_enabled:
         # Baseline: mismo set filtrado, SIN aplicar split (para comparar)
-        sim_kept_base, _ = _simulate_daily_rules(filtered_raw, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
+        sim_kept_base, _ = _simulate_daily_rules(filtered_raw, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win, use_log_daily_halt=use_log_daily_halt)
         pnl_sim_base = float(sim_kept_base["tradeRealized"].fillna(0).sum()) if (sim_kept_base is not None and len(sim_kept_base)) else 0.0
         pf_sim_base  = profit_factor(sim_kept_base) if (sim_kept_base is not None and len(sim_kept_base)) else np.nan
 
-    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
+    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win, use_log_daily_halt=use_log_daily_halt)
 
     # Comparativa principal: real vs simulado (filtros + reglas)
     
