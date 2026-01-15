@@ -1774,6 +1774,39 @@ def _goal_search_tp1_runner(
     return res
 
 
+def _df_sig_for_cache(df: pd.DataFrame) -> tuple:
+    """Deterministic, lightweight signature of a trades dataframe.
+
+    Purpose: invalidate cached goal-search results when the filtered universe changes.
+    """
+    if df is None or df.empty:
+        return (0, 0, None, None)
+
+    try:
+        n = int(len(df))
+        # Stable id hash: prefer atmId if present
+        if "atmId" in df.columns:
+            v = df["atmId"].astype(str)
+        else:
+            v = df.index.astype(str)
+        # Keep it fast for big datasets
+        if n > 2000:
+            v = pd.concat([v.head(1000), v.tail(1000)])
+        h = int(pd.util.hash_pandas_object(v, index=False).sum() % (2**63 - 1))
+
+        tcol = "exit_time" if ("exit_time" in df.columns and df["exit_time"].notna().any()) else ("entry_time" if "entry_time" in df.columns else None)
+        if tcol:
+            tt = pd.to_datetime(df[tcol], errors="coerce")
+            tt = tt[tt.notna()]
+            tmin = tt.min().isoformat() if len(tt) else None
+            tmax = tt.max().isoformat() if len(tt) else None
+        else:
+            tmin, tmax = None, None
+        return (n, h, tmin, tmax)
+    except Exception:
+        return (int(len(df)), 0, None, None)
+
+
 def plot_heatmap_weekday_hour_by_side(t: pd.DataFrame, min_trades: int):
     if t is None or t.empty:
         st.info("No hay datos para el heatmap.")
@@ -1929,6 +1962,7 @@ h2 {{ margin-top: 22px; border-bottom: 1px solid #eee; padding-bottom: 6px; }}
 def build_resultlab_pdf_bytes(title: str,
                               global_filters: dict,
                               global_notes: list,
+                              lab_filters: dict | None,
                               lab_filter_notes: list,
                               lab_cfg_lines: list,
                               metrics: dict,
@@ -1950,6 +1984,22 @@ def build_resultlab_pdf_bytes(title: str,
         story.append(Paragraph("• (sin notas)", styles["Normal"]))
     story.append(Spacer(1, 8))
 
+    if global_filters:
+        story.append(Paragraph("Filtro global (valores)", styles["Heading3"]))
+        rows_g = [["Campo", "Valor"]]
+        for k, v in global_filters.items():
+            rows_g.append([str(k), str(v)])
+        tbl_g = Table(rows_g, hAlign="LEFT")
+        tbl_g.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("PADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(tbl_g)
+        story.append(Spacer(1, 8))
+
     story.append(Paragraph("Configuración del Lab", styles["Heading2"]))
     for n in (lab_cfg_lines or []):
         story.append(Paragraph(f"• {n}", styles["Normal"]))
@@ -1958,6 +2008,22 @@ def build_resultlab_pdf_bytes(title: str,
         for n in lab_filter_notes:
             story.append(Paragraph(f"• {n}", styles["Normal"]))
     story.append(Spacer(1, 8))
+
+    if lab_filters:
+        story.append(Paragraph("Filtros del Lab (valores)", styles["Heading3"]))
+        rows_l = [["Campo", "Valor"]]
+        for k, v in lab_filters.items():
+            rows_l.append([str(k), str(v)])
+        tbl_l = Table(rows_l, hAlign="LEFT")
+        tbl_l.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("PADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(tbl_l)
+        story.append(Spacer(1, 8))
 
     story.append(Paragraph("Resultados (Real vs Simulado)", styles["Heading2"]))
     rows = [["Métrica", "Valor"]]
@@ -2043,6 +2109,24 @@ df = normalize_columns(df)
 t_all = pair_trades(df)
 # 't' será el dataset ACTIVO (tras filtro global)
 t = t_all
+
+# --- Auto-reset: si cargas un dataset NUEVO, reseteamos filtros de fecha/zoom al rango completo ---
+try:
+    _dmin0, _dmax0 = _date_bounds_from_trades(t_all)
+    if _dmin0 is not None and _dmax0 is not None:
+        _ds_sig = (int(len(t_all)), str(_dmin0), str(_dmax0), int(bad_total))
+        if st.session_state.get("dataset_sig") != _ds_sig:
+            st.session_state["dataset_sig"] = _ds_sig
+            # Global date filter widgets (sección de arriba)
+            st.session_state["gf_year_rng"] = (int(_dmin0.year), int(_dmax0.year))
+            st.session_state["gf_month_rng"] = (1, 12)
+            st.session_state["gf_d_range"] = (_dmin0, _dmax0)
+            # Daily PnL/DD chart (zoom local)
+            st.session_state["daily_use_global"] = True
+            st.session_state["daily_zoom"] = "Auto"
+            st.session_state["daily_local_range"] = (_dmin0, _dmax0)
+except Exception:
+    pass
 
 if bad_total > 0:
     st.caption(f"ℹ️ Líneas inválidas ignoradas al parsear: **{bad_total}**")
@@ -2664,6 +2748,27 @@ def _lab_quick_suggestions(t):
 
     return out
 
+
+def _infer_tick_size(df: pd.DataFrame) -> float:
+    """Infer TickSize from the dataset (points). Fallback to 0.25 (MNQ/NQ typical)."""
+    try:
+        if df is None or df.empty:
+            return 0.25
+        # Prefer an explicit tickSize column if present
+        for col in ["tickSize", "TickSize", "ticksz"]:
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce").dropna()
+                if len(s):
+                    # mode tends to be stable even with a few outliers
+                    m = s.mode()
+                    v = float(m.iloc[0]) if len(m) else float(s.median())
+                    if v > 0:
+                        return v
+        return 0.25
+    except Exception:
+        return 0.25
+
+
 def _apply_filters(df_in: pd.DataFrame):
     """
     Lab filters (opcional) aplicados ANTES de simular reglas diarias.
@@ -2671,6 +2776,7 @@ def _apply_filters(df_in: pd.DataFrame):
     """
     df = df_in.copy()
     notes: list[str] = []
+    tick_size = _infer_tick_size(df)
 
     # --- toggle: incluir trades con datos faltantes (NaN) ---
     include_missing = bool(st.session_state.get("lab_include_missing", True))
@@ -2693,24 +2799,55 @@ def _apply_filters(df_in: pd.DataFrame):
     label_to_hour = {lab: h for lab, h in zip(hour_labels, avail_hours)}
 
     # --- helper UI: slider rango basado en min/max del dataset ---
-    def _range_slider_for(col: str, key: str, title: str, unit_hint: str = ""):
+    def _range_slider_for(col: str, key: str, title: str, unit_hint: str = "", fixed_step: float | None = None):
         if col not in df.columns:
             return None
-        lo0, hi0 = _finite_minmax(df[col]) if "_finite_minmax" in globals() else (None, None)
+        lo0, hi0 = _finite_minmax(df[col])
         if lo0 is None or hi0 is None:
             return None
+
+        lo0 = float(lo0); hi0 = float(hi0)
+        if hi0 < lo0:
+            lo0, hi0 = hi0, lo0
+
         # default: rango completo (no filtra)
-        default = st.session_state.get(key, (float(lo0), float(hi0)))
+        default = st.session_state.get(key, (lo0, hi0))
         try:
             default = (float(default[0]), float(default[1]))
         except Exception:
-            default = (float(lo0), float(hi0))
+            default = (lo0, hi0)
 
-        step = max((float(hi0) - float(lo0)) / 200.0, 0.01)
+        # step: si nos dan un paso fijo (p.ej. TickSize), lo respetamos
+        if fixed_step is not None:
+            try:
+                step = float(fixed_step)
+            except Exception:
+                step = None
+        else:
+            step = None
+
+        if step is None or step <= 0:
+            step = max((hi0 - lo0) / 200.0, 0.01)
+        # evitar steps raros
+        if (hi0 - lo0) > 0 and step > (hi0 - lo0):
+            step = (hi0 - lo0)
+
+        # Snap del default al grid del step para poder elegir valores exactos (p.ej. 40.00, 40.25, 40.50...)
+        if step and step > 0:
+            def _snap(x: float) -> float:
+                try:
+                    return float(round((x - lo0) / step) * step + lo0)
+                except Exception:
+                    return x
+            default = (_snap(default[0]), _snap(default[1]))
+            # clamp + orden
+            a = min(max(default[0], lo0), hi0)
+            b = min(max(default[1], lo0), hi0)
+            default = (a, b) if a <= b else (b, a)
+
         label = f"{title}" + (f" ({unit_hint})" if unit_hint else "")
-        rng = st.slider(label, float(lo0), float(hi0), default, step=step, key=key)
+        rng = st.slider(label, lo0, hi0, default, step=step, key=key)
         return rng
-
     # --- helper: aplicar rango inclusivo (con opción de incluir NaN) ---
     def _apply_range_mask(dfx: pd.DataFrame, col: str, rng):
         if col not in dfx.columns or rng is None:
@@ -2787,8 +2924,8 @@ def _apply_filters(df_in: pd.DataFrame):
             sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
 
         # Rangos (si existen columnas)
-        or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)")
-        atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)")
+        or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)", fixed_step=tick_size)
+        atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)", fixed_step=tick_size)
 
         # EWO (umbral mínimo sobre |EWO|)
         ewo_col = "ewo" if "ewo" in df.columns else ("ewoMag" if "ewoMag" in df.columns else None)
@@ -2913,7 +3050,16 @@ def _simulate_daily_rules(df: pd.DataFrame,
 
     work = df.copy()
 
-    time_col = "entry_time" if "entry_time" in work.columns else ("exit_time" if "exit_time" in work.columns else None)
+    # Para reglas diarias basadas en PnL REALIZADO, preferimos EXIT (cierre del trade).
+    time_col = None
+    if "exit_time" in work.columns and work["exit_time"].notna().any():
+        time_col = "exit_time"
+    elif "entry_time" in work.columns and work["entry_time"].notna().any():
+        time_col = "entry_time"
+    elif "exit_time" in work.columns:
+        time_col = "exit_time"
+    elif "entry_time" in work.columns:
+        time_col = "entry_time"
     if time_col is None:
         # Sin tiempo no podemos simular "por día"
         return work, pd.DataFrame()
@@ -3321,6 +3467,30 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
             stop_big_win=stop_big_win,
         )
 
+        # Signature to detect when cached goal-search results are stale
+        def _goal_sig_current() -> tuple:
+            try:
+                rules_sig = (
+                    float(rules.get("max_loss", 0.0) or 0.0),
+                    float(rules.get("max_profit", 0.0) or 0.0),
+                    int(rules.get("max_trades", 0) or 0),
+                    int(rules.get("max_consec_losses", 0) or 0),
+                    bool(rules.get("stop_big_loss", False)),
+                    bool(rules.get("stop_big_win", False)),
+                )
+                return (
+                    _df_sig_for_cache(filtered_raw),
+                    rules_sig,
+                    float(goal_pnl), float(goal_dd),
+                    int(tp1_min), int(tp1_max), int(tp1_step),
+                    int(run_min), int(run_max), int(run_step),
+                    int(total_max), int(max_combos),
+                )
+            except Exception:
+                return (None,)
+
+        goal_sig = _goal_sig_current()
+
         if st.button("🔎 Buscar combinaciones", key="goal_search_btn"):
             with st.spinner("Probando combinaciones TP1/Runner..."):
                 res = _goal_search_tp1_runner(
@@ -3333,9 +3503,21 @@ with st.expander("🧙‍♂️ Modo Mago: Simular contratos (TP1 vs Runner) —
                     max_combos=int(max_combos),
                     rules=rules,
                 )
+            # Cache result + signature so we can detect staleness if filters/rules change
             st.session_state["goal_search_res"] = res
+            st.session_state["goal_search_sig"] = goal_sig
 
         res = st.session_state.get("goal_search_res", None)
+        prev_sig = st.session_state.get("goal_search_sig", None)
+        if (res is not None) and (prev_sig is not None) and (prev_sig != goal_sig):
+            st.info(
+                "🔄 Cambiaron los filtros/reglas desde la última búsqueda. "
+                "Pulsa **Buscar combinaciones** otra vez para recalcular con el set actual.",
+                icon="ℹ️",
+            )
+            res = None
+        # (res is only valid if signature matches current filters/rules)
+
         if isinstance(res, pd.DataFrame) and not res.empty:
             # Keep ONLY valid combos: PnL >= goal AND MaxDD <= goal (no "near misses" by default)
             if "Hit" in res.columns:
@@ -3540,6 +3722,7 @@ if ('real_df' in locals()) and ('sim_df' in locals()) and ('n_real' in locals())
                 title="ResultLab — Reporte",
                 global_filters=gf_dict if 'gf_dict' in globals() else {},
                 global_notes=gf_notes if 'gf_notes' in globals() else [],
+                lab_filters=lab_filters_dict,
                 lab_filter_notes=filter_notes,
                 lab_cfg_lines=cfg_lines,
                 metrics=pdf_metrics,
