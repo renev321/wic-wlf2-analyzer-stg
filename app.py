@@ -1648,34 +1648,99 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 
         sel_days = sorted(pd.Series(z_sel["day"].unique()).tolist())
 
-        # ---- Comparativa: (a) todo vs (b) sin selección vs (c) solo ganadores ----
+        # ---- Comparativa (CLARA): selección vs rango vs rango sin selección ----
         daily_all = z_all.groupby("day", as_index=False).agg(pnl=("pnl", "sum")).sort_values("day")
 
         def _maxdd_from_daily(dfx: pd.DataFrame) -> float:
+            # devuelve DD mínimo (negativo o 0)
             eq = dfx["pnl"].cumsum()
             peak = eq.cummax()
             dd = eq - peak
             return float(dd.min()) if len(dd) else 0.0
 
-        base_pnl = float(daily_all["pnl"].sum())
-        base_dd = _maxdd_from_daily(daily_all)
+        def _dd_mag(dd_min: float) -> float:
+            return float(-dd_min) if dd_min < 0 else 0.0
 
+        # Baseline = todo el rango visible
+        base_pnl = float(daily_all["pnl"].sum())
+        base_dd_min = _maxdd_from_daily(daily_all)
+        base_dd = _dd_mag(base_dd_min)
+
+        # Selección = SOLO los días seleccionados
+        daily_sel = daily_all.loc[daily_all["day"].isin(sel_days)].copy()
+        sel_pnl = float(daily_sel["pnl"].sum()) if len(daily_sel) else 0.0
+        sel_avg = float(daily_sel["pnl"].mean()) if len(daily_sel) else 0.0
+        sel_med = float(daily_sel["pnl"].median()) if len(daily_sel) else 0.0
+        sel_worst = float(daily_sel["pnl"].min()) if len(daily_sel) else 0.0
+        sel_best = float(daily_sel["pnl"].max()) if len(daily_sel) else 0.0
+        sel_dd = _dd_mag(_maxdd_from_daily(daily_sel)) if len(daily_sel) else 0.0
+
+        # Sin selección = “si hubieras NO operado esos días”
         daily_no_sel = daily_all.loc[~daily_all["day"].isin(sel_days)].copy()
         nosel_pnl = float(daily_no_sel["pnl"].sum())
-        nosel_dd = _maxdd_from_daily(daily_no_sel)
+        nosel_dd = _dd_mag(_maxdd_from_daily(daily_no_sel))
 
+        # Referencia: solo ganadores (para estimar costo de cortar setups buenos)
         daily_winners = daily_all.loc[daily_all["pnl"] > 0].copy()
-        win_pnl = float(daily_winners["pnl"].sum())
-        win_dd = _maxdd_from_daily(daily_winners) if len(daily_winners) else 0.0
+        win_pnl = float(daily_winners["pnl"].sum()) if len(daily_winners) else 0.0
+        win_dd = _dd_mag(_maxdd_from_daily(daily_winners)) if len(daily_winners) else 0.0
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("PnL total (rango)", f"{base_pnl:.0f}")
-        m2.metric("MaxDD (rango)", f"{base_dd:.0f}")
-        m3.metric("PnL SIN selección", f"{nosel_pnl:.0f}", delta=f"{nosel_pnl-base_pnl:.0f}")
-        m4.metric("MaxDD SIN selección", f"{nosel_dd:.0f}", delta=f"{nosel_dd-base_dd:.0f}")
+        # ---- Métricas (más intuitivas) ----
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Días seleccionados", f"{len(daily_sel)}")
+        c2.metric("PnL selección ($)", f"{sel_pnl:.0f}")
+        c3.metric("Avg/día (sel)", f"{sel_avg:.0f}")
+        c4.metric("Peor día (sel)", f"{sel_worst:.0f}")
+        c5.metric("Mejor día (sel)", f"{sel_best:.0f}")
 
-        st.caption(f"Referencia: **solo días ganadores** en el rango → PnL={win_pnl:.0f} | MaxDD={win_dd:.0f} (útil para ver el costo de ‘cortar’ setups buenos).")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("PnL rango (total)", f"{base_pnl:.0f}")
+        d2.metric("MaxDD rango", f"{base_dd:.0f}")
+        d3.metric("PnL SI saltas selección", f"{nosel_pnl:.0f}", delta=f"{nosel_pnl-base_pnl:.0f}")
+        d4.metric("MaxDD SI saltas selección", f"{nosel_dd:.0f}", delta=f"{(base_dd - nosel_dd):.0f}")
 
+        st.caption(
+            f"Referencia (costo de cortar): solo días ganadores → PnL={win_pnl:.0f} | MaxDD={win_dd:.0f}. "
+            f"DD selección (si SOLO operaras esos días)≈{sel_dd:.0f}."
+        )
+
+        # Si la selección es 'perdedores' pero el PnL selección sale positivo, alertamos (indica selección mixta o campo equivocado)
+        if sel_kind == "perdedores" and sel_pnl > 0:
+            st.warning("Ojo: la selección está marcada como 'perdedores' pero el PnL de la selección es positivo. Esto suele indicar que la selección incluye días mixtos o que el PnL diario no coincide con el PnL por trade. Prueba seleccionar un rectángulo más bajo (por ejemplo PnL < 0 claramente).")
+
+        # ---- Top días (para outliers) ----
+        if len(daily_sel) > 0:
+            z_day_counts = z_all2.groupby("day", as_index=False).agg(trades=("pnl", "size"))
+            top_sel = daily_sel.merge(z_day_counts, on="day", how="left").fillna({"trades": 0})
+            top_sel = top_sel.sort_values("pnl")
+
+            # métricas intradía: peak y giveback por día
+            def _day_peak_giveback(day_df):
+                eq = day_df["pnl"].cumsum()
+                peak = float(eq.max()) if len(eq) else 0.0
+                final = float(eq.iloc[-1]) if len(eq) else 0.0
+                gb_end = peak - final
+                # giveback max desde el peak hasta el mínimo posterior
+                i_peak = int(eq.values.argmax()) if len(eq) else 0
+                min_after = float(eq.iloc[i_peak:].min()) if len(eq) else final
+                gb_max = peak - min_after
+                return peak, gb_end, gb_max
+
+            peaks=[]
+            for d in top_sel["day"].tolist():
+                ddx = z_all2[z_all2["day"]==d].sort_values(["exit_time","_seq"], kind="mergesort")
+                peak, gb_end, gb_max = _day_peak_giveback(ddx)
+                peaks.append((d, peak, gb_end, gb_max))
+            import pandas as _pd
+            pk=_pd.DataFrame(peaks, columns=["day","peak_intra","giveback_end","giveback_max"])
+            top_sel = top_sel.merge(pk, on="day", how="left")
+
+            st.markdown("**Top días dentro de la selección (para entender outliers)**")
+            st.dataframe(
+                top_sel.head(12).rename(columns={"day":"día","pnl":"pnl_día","dd":"dd"}),
+                use_container_width=True,
+                hide_index=True,
+            )
         # ---- Diagnóstico: trade # en el día ----
         z_all2 = z_all.sort_values(["day", "exit_time", "_seq"], kind="mergesort")
         z_all2["trade_ord"] = z_all2.groupby("day").cumcount() + 1
@@ -1693,10 +1758,23 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
             pnl_med=("pnl", "median"),
         ).sort_values(["grp", "ord_bucket"])
 
-        st.markdown("**¿Se rompe después del trade #N? (promedio por orden en el día)**")
-        st.dataframe(ord_stats, use_container_width=True, hide_index=True)
+        st.markdown("**¿Se rompe después del trade #N? (comparación selección vs resto)**")
+        # tabla más útil: lado a lado + delta
+        sel_tbl = z_all2[z_all2["grp"] == "SELECCION"].groupby("ord_bucket", as_index=False).agg(
+            n_sel=("pnl", "size"),
+            pnl_prom_sel=("pnl", "mean"),
+            pnl_med_sel=("pnl", "median"),
+        )
+        resto_tbl = z_all2[z_all2["grp"] == "RESTO"].groupby("ord_bucket", as_index=False).agg(
+            n_resto=("pnl", "size"),
+            pnl_prom_resto=("pnl", "mean"),
+            pnl_med_resto=("pnl", "median"),
+        )
+        ord_cmp = sel_tbl.merge(resto_tbl, on="ord_bucket", how="outer").fillna(0)
+        ord_cmp["delta_prom(sel-resto)"] = ord_cmp["pnl_prom_sel"] - ord_cmp["pnl_prom_resto"]
+        ord_cmp = ord_cmp.sort_values("ord_bucket")
+        st.dataframe(ord_cmp, use_container_width=True, hide_index=True)
 
-        # ---- What-if: cortar el día después de N trades ----
         st.markdown("**What‑if: cortar el día después de N trades**")
         n_cap = st.slider("Cortar después de N trades (0 = sin corte)", 0, 10, 3, 1, key="sel_cap_n")
 
@@ -1708,7 +1786,7 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 
         daily_cap_all = _cap_daily(z_all2, n_cap)
         cap_all_pnl = float(daily_cap_all["pnl"].sum())
-        cap_all_dd = _maxdd_from_daily(daily_cap_all)
+        cap_all_dd = _dd_mag(_maxdd_from_daily(daily_cap_all))
 
         daily_cap_sel = daily_cap_all[daily_cap_all["day"].isin(sel_days)].copy()
         cap_sel_pnl = float(daily_cap_sel["pnl"].sum())
@@ -1718,7 +1796,7 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 
         cA, cB, cC = st.columns(3)
         cA.metric("PnL con corte (rango)", f"{cap_all_pnl:.0f}", delta=f"{cap_all_pnl-base_pnl:.0f}")
-        cB.metric("MaxDD con corte (rango)", f"{cap_all_dd:.0f}", delta=f"{cap_all_dd-base_dd:.0f}")
+        cB.metric("MaxDD con corte (rango)", f"{cap_all_dd:.0f}", delta=f"{(base_dd - cap_all_dd):.0f}")
         cC.metric("PnL en selección (con corte)", f"{cap_sel_pnl:.0f}")
 
         st.caption(f"Costo en días ganadores (con corte): PnL_ganadores={cap_win_pnl:.0f} (vs {win_pnl:.0f} sin corte).")
