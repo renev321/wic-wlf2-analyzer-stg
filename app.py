@@ -1298,17 +1298,26 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
     ss = st.session_state
 
     # Auto-reset rango global si cambiaste de dataset (evita quedar 'truncado' por un rango viejo)
-    _sig = f"{dmin.date().isoformat()}|{dmax.date().isoformat()}|{len(tdf_all)}"
+    # Normalize dmin/dmax (can be datetime/date/Timestamp) to date
+    def _to_date(x):
+        try:
+            # pandas Timestamp
+            return x.date()
+        except Exception:
+            return x
+    dmin_d = _to_date(dmin)
+    dmax_d = _to_date(dmax)
+    _sig = f"{dmin_d.isoformat()}|{dmax_d.isoformat()}|{len(tdf_all)}"
     if ss.get('gf_dataset_sig') != _sig:
         ss['gf_dataset_sig'] = _sig
-        ss['gf_d_from'] = dmin.date()
-        ss['gf_d_to'] = dmax.date()
+        ss['gf_d_from'] = dmin_d
+        ss['gf_d_to'] = dmax_d
         ss['gf_time_from'] = time(0, 0)
         ss['gf_time_to'] = time(23, 59)
-    ss.setdefault("gf_d_from", dmin)
-    ss.setdefault("gf_d_to", dmax)
-    ss.setdefault("gf_year_min", dmin.year)
-    ss.setdefault("gf_year_max", dmax.year)
+    ss.setdefault("gf_d_from", dmin_d)
+    ss.setdefault("gf_d_to", dmax_d)
+    ss.setdefault("gf_year_min", dmin_d.year)
+    ss.setdefault("gf_year_max", dmax_d.year)
     ss.setdefault("gf_months", month_opts)
     ss.setdefault("gf_weekdays", weekday_en)
     ss.setdefault("gf_dom_min", 1)
