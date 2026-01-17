@@ -5,7 +5,7 @@ import math
 import json
 import plotly.express as px
 
-from datetime import datetime, date
+from datetime import datetime, date, time
 import io
 # --- Optional dependency: ReportLab (PDF export) ---
 # Streamlit Cloud may not include it unless you add `reportlab` to requirements.txt.
