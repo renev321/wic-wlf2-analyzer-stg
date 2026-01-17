@@ -560,12 +560,21 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
                 t.drop(columns=drop_cols, inplace=True)
 
     for nm in [
+        # Identidad / instrumento
         "dir", "instrument", "tickSize", "pointValue",
+
+        # Órdenes / sizing
         "slTicks", "qtyTP1", "qtyRunner", "avgEntry",
+        "tp1Ticks", "tp2Ticks", "tp1R", "tp2R",
+
+        # Resultado / cierre (CRÍTICO para split TP1 vs Runner)
+        "tradeRealized", "dayRealized", "maxUnreal", "minUnreal",
+        "outcome", "exitReason", "forcedCloseReason", "dailyHalt",
+
+        # Contexto señal
         "template", "orderType", "trigger",
         "orHigh", "orLow", "orSize",
         "ewo", "atr", "useAtrEngine", "atrSlMult",
-        "tp1R", "tp2R", "tp1Ticks", "tp2Ticks",
         "tsBehindTP1Atr", "trailStepTicks",
         "deltaRatio", "dailyPnL",
         "cvd", "deltaBar", "deltaPrevBar"
@@ -1287,6 +1296,15 @@ def _render_global_date_filter(tdf_all: pd.DataFrame):
     weekday_labels = {en: es for en, es in _ES_WEEKDAY_ORDER}
 
     ss = st.session_state
+
+    # Auto-reset rango global si cambiaste de dataset (evita quedar 'truncado' por un rango viejo)
+    _sig = f"{dmin.date().isoformat()}|{dmax.date().isoformat()}|{len(tdf_all)}"
+    if ss.get('gf_dataset_sig') != _sig:
+        ss['gf_dataset_sig'] = _sig
+        ss['gf_d_from'] = dmin.date()
+        ss['gf_d_to'] = dmax.date()
+        ss['gf_time_from'] = time(0, 0)
+        ss['gf_time_to'] = time(23, 59)
     ss.setdefault("gf_d_from", dmin)
     ss.setdefault("gf_d_to", dmax)
     ss.setdefault("gf_year_min", dmin.year)
@@ -1525,19 +1543,139 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
     dd_df = daily[daily["dd"] < 0].copy()
     if dd_df.empty:
         st.info("No hubo drawdown intradía (DD=0) en el rango actual.")
-        return
+    else:
+        fig_d = px.bar(
+            dd_df,
+            x="day",
+            y="dd",
+            color="dd",
+            color_continuous_scale="Reds",
+            title="Drawdown intradía (solo días con DD < 0)",
+        )
+        fig_d.update_layout(xaxis_title="Fecha", yaxis_title="DD ($)", height=320, margin=dict(l=10,r=10,t=50,b=10))
+        fig_d.add_hline(y=0, line_dash="dash", opacity=0.4)
+        st.plotly_chart(fig_d, use_container_width=True)
 
-    fig_d = px.bar(
-        dd_df,
-        x="day",
-        y="dd",
-        color="dd",
-        color_continuous_scale="Reds",
-        title="Drawdown intradía (solo días con DD < 0)",
-    )
-    fig_d.update_layout(xaxis_title="Fecha", yaxis_title="DD ($)", height=320, margin=dict(l=10,r=10,t=50,b=10))
-    fig_d.add_hline(y=0, line_dash="dash", opacity=0.4)
-    st.plotly_chart(fig_d, use_container_width=True)
+
+    # --- Analisis por seleccion (fecha + PnL) ---
+    with st.expander("🔎 Analizar una selección (fecha + PnL)", expanded=False):
+        st.caption("Selecciona un rango de fechas y un rango de PnL diario para aislar días (por ejemplo, outliers negativos). Luego comparamos contra el universo completo del rango.")
+
+        # Controles de selección (equivalente a un 'rectángulo' en el gráfico)
+        cA, cB = st.columns(2)
+        with cA:
+            sel_from, sel_to = st.date_input(
+                "Fechas a analizar",
+                value=(min(daily["day"]), max(daily["day"])),
+                min_value=min(daily["day"]),
+                max_value=max(daily["day"]),
+                key="sel_days_range",
+            )
+        with cB:
+            pnl_min = float(daily["pnl"].min())
+            pnl_max = float(daily["pnl"].max())
+            # paso: 10$ por defecto para no ser demasiado sensible
+            sel_pnl_min, sel_pnl_max = st.slider(
+                "PnL diario ($) dentro de la selección",
+                min_value=float(pnl_min),
+                max_value=float(pnl_max),
+                value=(float(pnl_min), float(pnl_max)),
+                step=10.0,
+                key="sel_pnl_range",
+            )
+
+        mode_sel = st.radio(
+            "Tipo de selección",
+            options=["Rectángulo (fecha + PnL)", "Solo perdedores (PnL < 0)", "Solo ganadores (PnL > 0)"],
+            horizontal=True,
+            key="sel_mode",
+        )
+
+        dsel = daily.copy()
+        # Streamlit date_input puede devolver datetime/date; normalizamos a date
+        sel_from_d = pd.to_datetime(sel_from).date()
+        sel_to_d = pd.to_datetime(sel_to).date()
+
+        mask = (dsel["day"] >= sel_from_d) & (dsel["day"] <= sel_to_d) & (dsel["pnl"] >= sel_pnl_min) & (dsel["pnl"] <= sel_pnl_max)
+        if mode_sel == "Solo perdedores (PnL < 0)":
+            mask = mask & (dsel["pnl"] < 0)
+        elif mode_sel == "Solo ganadores (PnL > 0)":
+            mask = mask & (dsel["pnl"] > 0)
+
+        buckets_sel = dsel.loc[mask, "day"].tolist()
+        st.write(f"Días/buckets seleccionados: **{len(buckets_sel)}** de **{len(dsel)}**")
+        if len(buckets_sel) == 0:
+            st.info("La selección no contiene días. Ajusta el rango de PnL o fechas.")
+        else:
+            # Map bucket selection back to trades
+            z_all = z.copy()
+            z_all["_seq"] = np.arange(len(z_all))
+            z_all = z_all.sort_values(["exit_time", "_seq"], kind="mergesort")
+
+            if mode == "Semana":
+                z_all["bucket"] = z_all["day"].apply(_to_week)
+                z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
+            elif mode == "Mes":
+                z_all["bucket"] = z_all["day"].apply(_to_month)
+                z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
+            else:
+                z_sel = z_all[z_all["day"].isin(buckets_sel)].copy()
+
+            sel_days = sorted(pd.Series(z_sel["day"].unique()).tolist())
+            st.caption(f"Días reales cubiertos por la selección: {len(sel_days)}")
+
+            # ---- Comparativa: remover la selección ("si no tradeo estos días") ----
+            daily_all = z_all.groupby("day", as_index=False).agg(pnl=("pnl", "sum"))
+            daily_all = daily_all.sort_values("day")
+
+            def _maxdd_from_daily(dfx: pd.DataFrame) -> float:
+                eq = dfx["pnl"].cumsum()
+                peak = eq.cummax()
+                dd = eq - peak
+                return float(dd.min()) if len(dd) else 0.0
+
+            base_pnl = float(daily_all["pnl"].sum())
+            base_dd = _maxdd_from_daily(daily_all)
+
+            cut_mask = ~daily_all["day"].isin(sel_days)
+            daily_cut = daily_all.loc[cut_mask].copy()
+            cut_pnl = float(daily_cut["pnl"].sum())
+            cut_dd = _maxdd_from_daily(daily_cut)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("PnL total (rango)", f"{base_pnl:.0f}")
+            c2.metric("PnL sin selección", f"{cut_pnl:.0f}", delta=f"{cut_pnl-base_pnl:.0f}")
+            c3.metric("MaxDD sin selección", f"{cut_dd:.0f}", delta=f"{cut_dd-base_dd:.0f}")
+
+            # ---- Diagnóstico: ¿se rompe después de la N-ésima operación? ----
+            z_all = z_all.sort_values(["day", "exit_time", "_seq"], kind="mergesort")
+            z_all["trade_ord"] = z_all.groupby("day").cumcount() + 1
+
+            def _ord_bucket(n: int) -> str:
+                return str(n) if n <= 5 else "6+"
+
+            z_all["ord_bucket"] = z_all["trade_ord"].apply(_ord_bucket)
+            sel_set = set(sel_days)
+            z_all["grp"] = np.where(z_all["day"].isin(sel_set), "SELECCION", "RESTO")
+
+            ord_stats = z_all.groupby(["grp", "ord_bucket"], as_index=False).agg(
+                n=("pnl", "size"),
+                pnl_prom=("pnl", "mean"),
+                pnl_med=("pnl", "median"),
+            )
+            ord_stats = ord_stats.sort_values(["grp", "ord_bucket"])
+
+            st.markdown("**Promedio de PnL por orden de trade en el día (selección vs resto)**")
+            st.dataframe(ord_stats, use_container_width=True, hide_index=True)
+
+            # Pequeño resumen automático
+            try:
+                s_sel = ord_stats[ord_stats["grp"] == "SELECCION"].set_index("ord_bucket")
+                s_res = ord_stats[ord_stats["grp"] == "RESTO"].set_index("ord_bucket")
+                worst_bucket = (s_sel["pnl_prom"] - s_res["pnl_prom"]).sort_values().index[0]
+                st.info(f"Señal rápida: el mayor deterioro relativo en la selección aparece en el trade #{worst_bucket} del día (en promedio).")
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -1550,90 +1688,113 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
 # ============================================================
 def apply_split_tp1_runner(
     df: pd.DataFrame,
+    tp1_c: int,
+    run_c: int,
     *,
-    tp1_contracts: int,
-    runner_contracts: int,
-):
-    """What-if de contratos TP1 vs Runner (sin cambiar entradas/exits).
+    tick_value: float = None,
+) -> pd.DataFrame:
+    """Rescale trade PnL to a new (TP1, Runner) contract split.
 
-    Esto NO agrega contratos a mitad del trade (sin scale-in).
-    Solo re-escala la operación como si hubieras usado otro tamaño total y otro reparto TP1/Runner.
+    Key idea:
+    - Your JSON already contains the *realized PnL for the original split*.
+    - If we can infer how much of that PnL came from TP1 vs Runner, we can
+      recompose PnL for a new split without changing entries/exits.
 
-    Cómo se calcula (según tu JSON actual):
-    - Para trades con exitReason == 'TRAIL': se asume que TP1 se ejecutó a `tp1Ticks` y el Runner capturó el resto.
-      Entonces inferimos `runner_ticks` del trade original y re-armamos el PnL con los nuevos contratos.
-    - Para trades que NO son 'TRAIL' (SL/BE/SESSION_END): asumimos que NO hubo TP1 parcial,
-      así que escalamos el resultado por contrato: (PnL_original / qty_total_original) * qty_total_nuevo.
+    What we know from logs:
+    - qtyTP1 / qtyRunner (original)
+    - tp1Ticks, slTicks, exitReason, tradeRealized, maxUnreal
 
-    Si el nuevo split coincide exactamente con el original (tp1/runner/total), el PnL queda idéntico.
+    Robust behaviour:
+    - If TP1 was never hit (likely), we fall back to simple per-contract scaling.
+    - If TP1 was hit (likely), we allocate TP1 profit explicitly and infer
+      runner PnL as the residual.
+
+    This makes (9,2) differ from (2,9) **only when** the trade actually had
+    a partial TP1 component in the original run (which is the realistic case).
     """
+
     if df is None or df.empty:
         return df
 
     z = df.copy()
-    if "tradeRealized" not in z.columns:
-        return z
 
     # sanitize inputs
-    tp1_c = int(max(0, tp1_contracts))
-    run_c = int(max(0, runner_contracts))
-    total_new = int(max(1, tp1_c + run_c))
+    try:
+        tp1_c = int(tp1_c)
+        run_c = int(run_c)
+    except Exception:
+        tp1_c, run_c = 0, 0
+    tp1_c = max(0, tp1_c)
+    run_c = max(0, run_c)
+    total_new = tp1_c + run_c
 
-    z["tradeRealized_orig"] = pd.to_numeric(z["tradeRealized"], errors="coerce")
+    # Original split (prefer explicit qtyTP1/qtyRunner; fall back to qtyTotal/qty)
+    q1 = pd.to_numeric(z.get("qtyTP1", np.nan), errors="coerce")
+    qr = pd.to_numeric(z.get("qtyRunner", np.nan), errors="coerce")
 
-    # Original totals (per trade)
-    if "qty_total" in z.columns:
-        qtot = pd.to_numeric(z["qty_total"], errors="coerce")
+    if "qtyTP1" not in z.columns and "qtyRunner" not in z.columns:
+        # fall back to older naming
+        qtot_fallback = pd.to_numeric(z.get("qtyTotal", z.get("qty", np.nan)), errors="coerce")
+        q1 = pd.Series(np.nan, index=z.index)
+        qr = pd.Series(np.nan, index=z.index)
+        qtot = qtot_fallback
     else:
-        q1o = pd.to_numeric(z.get("qtyTP1", np.nan), errors="coerce")
-        qro = pd.to_numeric(z.get("qtyRunner", np.nan), errors="coerce")
-        qtot = q1o.fillna(0) + qro.fillna(0)
+        q1 = q1.fillna(0.0)
+        qr = qr.fillna(0.0)
+        qtot = q1 + qr
 
-    qtot = qtot.where(np.isfinite(qtot) & (qtot > 0), np.nan)
+    tr = pd.to_numeric(z.get("tradeRealized", np.nan), errors="coerce")
 
-    # Ensure tick_value exists ($ per tick for 1 contract)
-    if "tick_value" not in z.columns:
-        if "tickSize" in z.columns and "pointValue" in z.columns:
-            z["tick_value"] = pd.to_numeric(z["tickSize"], errors="coerce") * pd.to_numeric(z["pointValue"], errors="coerce")
-        else:
-            z["tick_value"] = np.nan
+    # tick_value ($ per tick per contract)
+    if tick_value is None:
+        ts = pd.to_numeric(z.get("tickSize", np.nan), errors="coerce")
+        pv = pd.to_numeric(z.get("pointValue", np.nan), errors="coerce")
+        tv = ts * pv
+        # reasonable fallback (MNQ is 0.5/tick): if missing, keep 1.0 so scaling is stable
+        tv = tv.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    else:
+        tv = pd.Series(float(tick_value), index=z.index)
 
-    tv = pd.to_numeric(z["tick_value"], errors="coerce")
-    tr = pd.to_numeric(z["tradeRealized_orig"], errors="coerce")
+    tp1_ticks = pd.to_numeric(z.get("tp1Ticks", np.nan), errors="coerce").fillna(0.0)
+    max_unreal = pd.to_numeric(z.get("maxUnreal", np.nan), errors="coerce")
 
-    # Total ticks (for the whole trade)
-    ticks_total = tr / tv
+    # Potential TP1 component in original run
+    tp1_possible = (q1 > 0) & (tp1_ticks > 0) & np.isfinite(tv) & np.isfinite(tr)
+    tp1_pnl_orig = tp1_ticks * tv * q1
 
-    # Per-contract ticks for trades where TP1 was not partial (fallback model)
-    per_contract_ticks = np.where(np.isfinite(qtot) & (qtot > 0) & np.isfinite(ticks_total), ticks_total / qtot, np.nan)
+    # Tolerance ~ 1 tick per TP1 contract (helps with commissions/slippage)
+    tol = np.maximum(1.0, np.abs(tv) * np.maximum(1.0, q1))
 
-    # Infer runner ticks for TRAIL trades (needs original split + tp1Ticks)
-    q1 = pd.to_numeric(z.get("qtyTP1", 0), errors="coerce").fillna(0)
-    qr = pd.to_numeric(z.get("qtyRunner", 0), errors="coerce").fillna(0)
-    tp1_ticks = pd.to_numeric(z.get("tp1Ticks", np.nan), errors="coerce")
-    exit_reason = z.get("exitReason", pd.Series([None] * len(z), index=z.index))
-    is_trail = exit_reason.astype(str).str.upper().eq("TRAIL")
+    exit_reason = z.get("exitReason", "")
+    er = exit_reason.astype(str).str.upper()
 
-    runner_ticks = np.where(
-        (is_trail) & (qr > 0) & np.isfinite(ticks_total) & np.isfinite(tp1_ticks),
-        (ticks_total - (q1 * tp1_ticks)) / qr,
-        np.nan
+    # Infer whether TP1 likely hit in original trade
+    # - TRAIL: almost certainly yes
+    # - Otherwise: if maxUnreal reached TP1 profit threshold OR realized PnL is meaningfully positive
+    tp1_hit = tp1_possible & (
+        er.eq("TRAIL") |
+        (np.isfinite(max_unreal) & (max_unreal >= (tp1_pnl_orig - tol))) |
+        (tr >= tol)
     )
 
-    # Simulated ticks total
-    sim_ticks = np.where(
-        is_trail & np.isfinite(runner_ticks) & np.isfinite(tp1_ticks),
-        (tp1_c * tp1_ticks) + (run_c * runner_ticks),
-        (total_new * per_contract_ticks)
+    # Decompose original PnL: TP1 part + residual runner part
+    tp1_part = np.where(tp1_hit, tp1_pnl_orig, 0.0)
+    runner_part = tr - tp1_part
+
+    # Runner per-contract residual (if original runner exists)
+    runner_per_contract = np.where(qr > 0, runner_part / np.maximum(qr, 1.0), 0.0)
+
+    # Fallback per-contract PnL when TP1 not hit (allocation irrelevant)
+    per_contract = np.where(qtot > 0, tr / np.maximum(qtot, 1.0), 0.0)
+
+    # Compose simulated realized PnL
+    sim_realized = np.where(
+        tp1_hit,
+        (tp1_ticks * tv * tp1_c) + (runner_per_contract * run_c),
+        per_contract * total_new
     )
 
-    sim_realized = sim_ticks * tv
-
-    # Fallback if tick_value is missing: scale original PnL by (newTotal/origTotal)
-    scale = np.where(np.isfinite(qtot) & (qtot > 0), total_new / qtot, 1.0)
-    sim_realized = np.where(np.isfinite(sim_realized), sim_realized, tr * scale)
-
-    # If new split matches original exactly, keep exact original PnL
+    # Guard: if new split is identical to original, keep exact original PnL
     same_all = (
         np.isfinite(qtot) &
         (np.round(qtot) == total_new) &
@@ -1646,9 +1807,10 @@ def apply_split_tp1_runner(
     z["split_total"] = total_new
     z["split_tp1"] = tp1_c
     z["split_runner"] = run_c
-    z["split_mode"] = np.where(is_trail, "TRAIL(tp1+runner)", "SCALE(per-contract)")
+    z["split_mode"] = np.where(tp1_hit, "DECOMP(tp1+runner)", "SCALE(per-contract)")
     z["split_cfg"] = "force_tp1_runner"
     return z
+
 
 
 
@@ -2944,8 +3106,8 @@ def _apply_filters(df_in: pd.DataFrame):
             sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
 
         # Rangos (si existen columnas)
-        or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)", fixed_step=tick_size)
-        atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)", fixed_step=tick_size)
+        or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)", fixed_step=0.25)
+        atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)", fixed_step=0.25)
 
         # EWO (umbral mínimo sobre |EWO|)
         ewo_col = "ewo" if "ewo" in df.columns else ("ewoMag" if "ewoMag" in df.columns else None)
@@ -3046,8 +3208,7 @@ def _simulate_daily_rules(df: pd.DataFrame,
                           max_trades: int = 0,
                           max_consec_losses: int = 0,
                           stop_big_loss: bool = False,
-                          stop_big_win: bool = False,
-                          use_log_daily_halt: bool = True):
+                          stop_big_win: bool = False):
     """Simula reglas diarias sobre un DataFrame de trades.
 
     Devuelve:
@@ -3095,55 +3256,12 @@ def _simulate_daily_rules(df: pd.DataFrame,
     if with_time.empty:
         return work, pd.DataFrame()
 
-    with_time = with_time.sort_values(time_col)
+    with_time["_seq"] = np.arange(len(with_time))
+    with_time = with_time.sort_values([time_col, "_seq"], kind="mergesort")
     with_time["day"] = with_time[time_col].dt.date
 
     kept_idx = []
     stop_rows = []
-
-    # Si el log ya trae 'dailyHalt' (corte real del robot), podemos reproducirlo EXACTO.
-    # Esto es ideal para validar: "mi JSON vs el Lab" sin que haya discrepancias por interpretación.
-    # OJO: si cambias las reglas (max_loss/max_profit/etc) o usas Modo Mago (reescalado), desactívalo.
-    if use_log_daily_halt and "dailyHalt" in with_time.columns:
-        def _to_bool(v) -> bool:
-            if isinstance(v, bool):
-                return v
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                return False
-            s = str(v).strip().lower()
-            return s in ("true", "1", "yes", "y", "t")
-
-        for day, g in with_time.groupby("day", sort=False):
-            g = g.sort_values(time_col)
-            halt_mask = g["dailyHalt"].apply(_to_bool).to_numpy()
-            if halt_mask.any():
-                first_pos = int(np.where(halt_mask)[0][0])
-                keep = g.iloc[: first_pos + 1]
-                omit = g.iloc[first_pos + 1 :]
-                kept_idx.extend(keep.index.tolist())
-                if len(omit) > 0:
-                    stop_rows.append({
-                        "day": day,
-                        "motivo": "Corte del log (dailyHalt)",
-                        "trades_omitidos": int(len(omit)),
-                    })
-            else:
-                kept_idx.extend(g.index.tolist())
-
-        kept_df = with_time.loc[kept_idx].copy()
-        # Agregar trades sin timestamp (no se pueden cortar por día)
-        if not no_time.empty:
-            kept_df = pd.concat([kept_df, no_time], ignore_index=False)
-
-        if time_col in kept_df.columns:
-            try:
-                kept_df = kept_df.sort_values(time_col)
-            except Exception:
-                pass
-
-        stops_df = pd.DataFrame(stop_rows)
-        return kept_df, stops_df
-
     # Prioridad cuando varias reglas se disparan en el mismo trade
     def _pick_motivo(candidates):
         priority = [
@@ -3232,7 +3350,8 @@ def _simulate_daily_rules(df: pd.DataFrame,
     # Orden final estable por el mismo time_col (si existe)
     if time_col in kept_df.columns:
         try:
-            kept_df = kept_df.sort_values(time_col)
+            kept_df["_seq2"] = np.arange(len(kept_df))
+            kept_df = kept_df.sort_values([time_col, "_seq2"], kind="mergesort")
         except Exception:
             pass
 
@@ -3251,7 +3370,6 @@ def _reset_lab_state(base_df: pd.DataFrame):
     st.session_state["lab_max_consec_losses"] = 0
     st.session_state["lab_stop_big_loss"] = False
     st.session_state["lab_stop_big_win"] = False
-    st.session_state["lab_use_log_daily_halt"] = True
 
     # -------------------- Helpers --------------------
     def _minmax(col: str, default=(0.0, 1.0)):
@@ -3327,6 +3445,8 @@ reset_col, reset_info = st.columns([1, 3])
 with reset_col:
     if st.button("🔄 Reset experimento", help="Resetea TODO (reglas sin límite + sin filtros) para que el Lab coincida 1:1 con el Resumen rápido."):
         _reset_lab_state(t)
+
+        _do_rerun()
 with reset_info:
     st.caption("Idea: el Lab **empieza igual que el Resumen rápido**. Luego ajustas reglas/filtros para ver el impacto (what‑if).")
 
@@ -3354,22 +3474,6 @@ with lab_left:
                                 key="lab_stop_big_loss")
     stop_big_win = st.checkbox("Cortar el día tras un ganador grande (RR ≥ 2)", value=bool(st.session_state.get("lab_stop_big_win", False)),
                                key="lab_stop_big_win")
-
-
-    # --- Comparación 1:1 (validación) ---
-    # Si está activo y el dataset trae la columna dailyHalt, el simulador NO recalcula el corte por MaxLoss/MaxProfit:
-    # reproduce exactamente dónde tu robot cortó el día en el log. Útil para validar que el Lab coincide con tu replay.
-    use_log_daily_halt = st.checkbox(
-        "Usar cortes del log (dailyHalt) para comparar 1:1",
-        value=bool(st.session_state.get("lab_use_log_daily_halt", True)),
-        key="lab_use_log_daily_halt",
-        help=(
-            "Recomendado para validación (mismo JSON): el Lab cortará días EXACTAMENTE donde el log dice dailyHalt=True. "
-            "Si vas a hacer what-if (cambiar reglas o Modo Mago), apágalo para que el simulador recalculé los cortes."
-        ),
-    )
-
-
     st.markdown("---")
     st.markdown("**🧭 Sugerencias rápidas (según tu historial real)**")
     sugg = _lab_quick_suggestions(t)
@@ -3656,7 +3760,6 @@ else:
     st.caption("Filtros activos: ninguno (equivale al Resumen rápido).")
 
 # Simulación
-use_log_daily_halt = bool(st.session_state.get("lab_use_log_daily_halt", True))
 if filtered is None or filtered.empty:
     st.info("Con los filtros actuales no quedan trades para simular.")
 else:
@@ -3667,12 +3770,11 @@ else:
     pf_sim_base = None
     if split_enabled:
         # Baseline: mismo set filtrado, SIN aplicar split (para comparar)
-        sim_kept_base, _ = _simulate_daily_rules(filtered_raw, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win, use_log_daily_halt=use_log_daily_halt)
+        sim_kept_base, _ = _simulate_daily_rules(filtered_raw, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
         pnl_sim_base = float(sim_kept_base["tradeRealized"].fillna(0).sum()) if (sim_kept_base is not None and len(sim_kept_base)) else 0.0
         pf_sim_base  = profit_factor(sim_kept_base) if (sim_kept_base is not None and len(sim_kept_base)) else np.nan
 
-    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win, use_log_daily_halt=use_log_daily_halt)
-
+    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
     # Comparativa principal: real vs simulado (filtros + reglas)
     
     # ------------------------------------------------------------
