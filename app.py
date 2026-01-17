@@ -1547,8 +1547,62 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
     )
     fig_p.update_layout(xaxis_title="Fecha", yaxis_title="PnL ($)", height=360, margin=dict(l=10,r=10,t=50,b=10))
     fig_p.add_hline(y=0, line_dash="dash", opacity=0.4)
-    st.plotly_chart(fig_p, use_container_width=True)
+    # --- Seleccion real con mouse (rectángulo sobre barras) ---
+    # Streamlit soporta selección en Plotly vía on_select + selection_mode.
+    # Usamos un key versionado para poder “limpiar” la selección.
+    ss = st.session_state
+    if "daily_sel_keyver" not in ss:
+        ss["daily_sel_keyver"] = 0
 
+    fig_p.update_layout(dragmode="select", clickmode="event+select")
+    fig_p.update_traces(customdata=np.stack([pd.to_datetime(daily["day"]).astype(str).values, daily["pnl"].values], axis=1))
+
+    topc1, topc2, topc3 = st.columns([1.2, 2.5, 3.3])
+    with topc1:
+        if st.button("🧽 Limpiar selección", key=f"btn_clear_sel_{ss['daily_sel_keyver']}"):
+            ss["daily_sel_keyver"] += 1
+            _st_rerun()
+    with topc2:
+        st.caption("Tip: usa el modo **Box Select** (rectángulo) en la barra del gráfico o arrastra para seleccionar. Doble‑click limpia.")
+    with topc3:
+        apply_sel = st.checkbox("Aplicar selección a los análisis", value=True, key="daily_apply_sel")
+
+    chart_key = f"daily_pnl_chart_{ss['daily_sel_keyver']}"
+    ev = st.plotly_chart(
+        fig_p,
+        use_container_width=True,
+        key=chart_key,
+        on_select="rerun",
+        selection_mode=("box", "lasso", "points"),
+        config={"scrollZoom": False, "displayModeBar": True},
+    )
+
+    # Extraer índices seleccionados
+    point_indices = []
+    sel_state = None
+    try:
+        sel_state = ev.selection
+    except Exception:
+        sel_state = ev.get("selection") if isinstance(ev, dict) else None
+
+    if sel_state is not None:
+        try:
+            point_indices = list(sel_state.point_indices)
+        except Exception:
+            try:
+                point_indices = list(sel_state.get("point_indices", []))
+            except Exception:
+                point_indices = []
+
+    buckets_sel = []
+    if apply_sel and point_indices:
+        # point_indices apuntan a filas del DataFrame usado por px.bar
+        # (una sola traza). Si hubiese duplicados, usamos unique.
+        idx = sorted(set(int(i) for i in point_indices if i is not None))
+        idx = [i for i in idx if 0 <= i < len(daily)]
+        buckets_sel = daily.iloc[idx]["day"].tolist()
+
+    # --- Gráfico de DD ---
     dd_df = daily[daily["dd"] < 0].copy()
     if dd_df.empty:
         st.info("No hubo drawdown intradía (DD=0) en el rango actual.")
@@ -1565,12 +1619,116 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
         fig_d.add_hline(y=0, line_dash="dash", opacity=0.4)
         st.plotly_chart(fig_d, use_container_width=True)
 
+    # --- Análisis basado en selección REAL ---
+    if buckets_sel:
+        # Clasificar selección
+        sel_pnls = daily[daily["day"].isin(buckets_sel)]["pnl"]
+        sel_kind = "mixta"
+        if (sel_pnls.max() <= 0):
+            sel_kind = "perdedores"
+        elif (sel_pnls.min() >= 0):
+            sel_kind = "ganadores"
 
-    # --- Analisis por seleccion (fecha + PnL) ---
-    with st.expander("🔎 Analizar una selección (fecha + PnL)", expanded=False):
-        st.caption("Selecciona un rango de fechas y un rango de PnL diario para aislar días (por ejemplo, outliers negativos). Luego comparamos contra el universo completo del rango.")
+        st.markdown("#### 🔍 Análisis de la selección")
+        st.caption(f"Seleccionaste **{len(buckets_sel)}** barras ({mode}). Tipo: **{sel_kind}**. Abajo comparamos contra **todo el rango** y contra **solo ganadores**.")
 
-        # Controles de selección (equivalente a un 'rectángulo' en el gráfico)
+        # Map bucket selection back to trades
+        z_all = z.copy()
+        z_all["_seq"] = np.arange(len(z_all))
+        z_all = z_all.sort_values(["exit_time", "_seq"], kind="mergesort")
+
+        if mode == "Semana":
+            z_all["bucket"] = z_all["day"].apply(_to_week)
+            z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
+        elif mode == "Mes":
+            z_all["bucket"] = z_all["day"].apply(_to_month)
+            z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
+        else:
+            z_sel = z_all[z_all["day"].isin(buckets_sel)].copy()
+
+        sel_days = sorted(pd.Series(z_sel["day"].unique()).tolist())
+
+        # ---- Comparativa: (a) todo vs (b) sin selección vs (c) solo ganadores ----
+        daily_all = z_all.groupby("day", as_index=False).agg(pnl=("pnl", "sum")).sort_values("day")
+
+        def _maxdd_from_daily(dfx: pd.DataFrame) -> float:
+            eq = dfx["pnl"].cumsum()
+            peak = eq.cummax()
+            dd = eq - peak
+            return float(dd.min()) if len(dd) else 0.0
+
+        base_pnl = float(daily_all["pnl"].sum())
+        base_dd = _maxdd_from_daily(daily_all)
+
+        daily_no_sel = daily_all.loc[~daily_all["day"].isin(sel_days)].copy()
+        nosel_pnl = float(daily_no_sel["pnl"].sum())
+        nosel_dd = _maxdd_from_daily(daily_no_sel)
+
+        daily_winners = daily_all.loc[daily_all["pnl"] > 0].copy()
+        win_pnl = float(daily_winners["pnl"].sum())
+        win_dd = _maxdd_from_daily(daily_winners) if len(daily_winners) else 0.0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("PnL total (rango)", f"{base_pnl:.0f}")
+        m2.metric("MaxDD (rango)", f"{base_dd:.0f}")
+        m3.metric("PnL SIN selección", f"{nosel_pnl:.0f}", delta=f"{nosel_pnl-base_pnl:.0f}")
+        m4.metric("MaxDD SIN selección", f"{nosel_dd:.0f}", delta=f"{nosel_dd-base_dd:.0f}")
+
+        st.caption(f"Referencia: **solo días ganadores** en el rango → PnL={win_pnl:.0f} | MaxDD={win_dd:.0f} (útil para ver el costo de ‘cortar’ setups buenos).")
+
+        # ---- Diagnóstico: trade # en el día ----
+        z_all2 = z_all.sort_values(["day", "exit_time", "_seq"], kind="mergesort")
+        z_all2["trade_ord"] = z_all2.groupby("day").cumcount() + 1
+
+        def _ord_bucket(n: int) -> str:
+            return str(n) if n <= 5 else "6+"
+
+        z_all2["ord_bucket"] = z_all2["trade_ord"].apply(_ord_bucket)
+        sel_set = set(sel_days)
+        z_all2["grp"] = np.where(z_all2["day"].isin(sel_set), "SELECCION", "RESTO")
+
+        ord_stats = z_all2.groupby(["grp", "ord_bucket"], as_index=False).agg(
+            n=("pnl", "size"),
+            pnl_prom=("pnl", "mean"),
+            pnl_med=("pnl", "median"),
+        ).sort_values(["grp", "ord_bucket"])
+
+        st.markdown("**¿Se rompe después del trade #N? (promedio por orden en el día)**")
+        st.dataframe(ord_stats, use_container_width=True, hide_index=True)
+
+        # ---- What-if: cortar el día después de N trades ----
+        st.markdown("**What‑if: cortar el día después de N trades**")
+        n_cap = st.slider("Cortar después de N trades (0 = sin corte)", 0, 10, 3, 1, key="sel_cap_n")
+
+        def _cap_daily(daily_trades: pd.DataFrame, N: int) -> pd.DataFrame:
+            if N <= 0:
+                return daily_trades.groupby("day", as_index=False).agg(pnl=("pnl", "sum")).sort_values("day")
+            tmp = daily_trades[daily_trades["trade_ord"] <= N]
+            return tmp.groupby("day", as_index=False).agg(pnl=("pnl", "sum")).sort_values("day")
+
+        daily_cap_all = _cap_daily(z_all2, n_cap)
+        cap_all_pnl = float(daily_cap_all["pnl"].sum())
+        cap_all_dd = _maxdd_from_daily(daily_cap_all)
+
+        daily_cap_sel = daily_cap_all[daily_cap_all["day"].isin(sel_days)].copy()
+        cap_sel_pnl = float(daily_cap_sel["pnl"].sum())
+
+        # costo en ganadores
+        cap_win_pnl = float(daily_cap_all[daily_cap_all["pnl"] > 0]["pnl"].sum())
+
+        cA, cB, cC = st.columns(3)
+        cA.metric("PnL con corte (rango)", f"{cap_all_pnl:.0f}", delta=f"{cap_all_pnl-base_pnl:.0f}")
+        cB.metric("MaxDD con corte (rango)", f"{cap_all_dd:.0f}", delta=f"{cap_all_dd-base_dd:.0f}")
+        cC.metric("PnL en selección (con corte)", f"{cap_sel_pnl:.0f}")
+
+        st.caption(f"Costo en días ganadores (con corte): PnL_ganadores={cap_win_pnl:.0f} (vs {win_pnl:.0f} sin corte).")
+
+    else:
+        st.caption("⬆️ Selecciona barras con el rectángulo (Box Select) para analizar: pérdidas grandes, ganadores, o una zona mixta.")
+
+    # --- Modo manual (fallback) ---
+    with st.expander("(Opcional) Selección manual por sliders", expanded=False):
+        st.caption("Si no puedes usar selección con mouse, usa este modo. Es equivalente al rectángulo (fecha + PnL).")
         cA, cB = st.columns(2)
         with cA:
             sel_from, sel_to = st.date_input(
@@ -1583,7 +1741,6 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
         with cB:
             pnl_min = float(daily["pnl"].min())
             pnl_max = float(daily["pnl"].max())
-            # paso: 10$ por defecto para no ser demasiado sensible
             sel_pnl_min, sel_pnl_max = st.slider(
                 "PnL diario ($) dentro de la selección",
                 min_value=float(pnl_min),
@@ -1593,98 +1750,9 @@ def plot_daily_pnl_dd_zoom(tdf: pd.DataFrame, global_range: tuple):
                 key="sel_pnl_range",
             )
 
-        mode_sel = st.radio(
-            "Tipo de selección",
-            options=["Rectángulo (fecha + PnL)", "Solo perdedores (PnL < 0)", "Solo ganadores (PnL > 0)"],
-            horizontal=True,
-            key="sel_mode",
-        )
-
-        dsel = daily.copy()
-        # Streamlit date_input puede devolver datetime/date; normalizamos a date
-        sel_from_d = pd.to_datetime(sel_from).date()
-        sel_to_d = pd.to_datetime(sel_to).date()
-
-        mask = (dsel["day"] >= sel_from_d) & (dsel["day"] <= sel_to_d) & (dsel["pnl"] >= sel_pnl_min) & (dsel["pnl"] <= sel_pnl_max)
-        if mode_sel == "Solo perdedores (PnL < 0)":
-            mask = mask & (dsel["pnl"] < 0)
-        elif mode_sel == "Solo ganadores (PnL > 0)":
-            mask = mask & (dsel["pnl"] > 0)
-
-        buckets_sel = dsel.loc[mask, "day"].tolist()
-        st.write(f"Días/buckets seleccionados: **{len(buckets_sel)}** de **{len(dsel)}**")
-        if len(buckets_sel) == 0:
-            st.info("La selección no contiene días. Ajusta el rango de PnL o fechas.")
-        else:
-            # Map bucket selection back to trades
-            z_all = z.copy()
-            z_all["_seq"] = np.arange(len(z_all))
-            z_all = z_all.sort_values(["exit_time", "_seq"], kind="mergesort")
-
-            if mode == "Semana":
-                z_all["bucket"] = z_all["day"].apply(_to_week)
-                z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
-            elif mode == "Mes":
-                z_all["bucket"] = z_all["day"].apply(_to_month)
-                z_sel = z_all[z_all["bucket"].isin(buckets_sel)].copy()
-            else:
-                z_sel = z_all[z_all["day"].isin(buckets_sel)].copy()
-
-            sel_days = sorted(pd.Series(z_sel["day"].unique()).tolist())
-            st.caption(f"Días reales cubiertos por la selección: {len(sel_days)}")
-
-            # ---- Comparativa: remover la selección ("si no tradeo estos días") ----
-            daily_all = z_all.groupby("day", as_index=False).agg(pnl=("pnl", "sum"))
-            daily_all = daily_all.sort_values("day")
-
-            def _maxdd_from_daily(dfx: pd.DataFrame) -> float:
-                eq = dfx["pnl"].cumsum()
-                peak = eq.cummax()
-                dd = eq - peak
-                return float(dd.min()) if len(dd) else 0.0
-
-            base_pnl = float(daily_all["pnl"].sum())
-            base_dd = _maxdd_from_daily(daily_all)
-
-            cut_mask = ~daily_all["day"].isin(sel_days)
-            daily_cut = daily_all.loc[cut_mask].copy()
-            cut_pnl = float(daily_cut["pnl"].sum())
-            cut_dd = _maxdd_from_daily(daily_cut)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PnL total (rango)", f"{base_pnl:.0f}")
-            c2.metric("PnL sin selección", f"{cut_pnl:.0f}", delta=f"{cut_pnl-base_pnl:.0f}")
-            c3.metric("MaxDD sin selección", f"{cut_dd:.0f}", delta=f"{cut_dd-base_dd:.0f}")
-
-            # ---- Diagnóstico: ¿se rompe después de la N-ésima operación? ----
-            z_all = z_all.sort_values(["day", "exit_time", "_seq"], kind="mergesort")
-            z_all["trade_ord"] = z_all.groupby("day").cumcount() + 1
-
-            def _ord_bucket(n: int) -> str:
-                return str(n) if n <= 5 else "6+"
-
-            z_all["ord_bucket"] = z_all["trade_ord"].apply(_ord_bucket)
-            sel_set = set(sel_days)
-            z_all["grp"] = np.where(z_all["day"].isin(sel_set), "SELECCION", "RESTO")
-
-            ord_stats = z_all.groupby(["grp", "ord_bucket"], as_index=False).agg(
-                n=("pnl", "size"),
-                pnl_prom=("pnl", "mean"),
-                pnl_med=("pnl", "median"),
-            )
-            ord_stats = ord_stats.sort_values(["grp", "ord_bucket"])
-
-            st.markdown("**Promedio de PnL por orden de trade en el día (selección vs resto)**")
-            st.dataframe(ord_stats, use_container_width=True, hide_index=True)
-
-            # Pequeño resumen automático
-            try:
-                s_sel = ord_stats[ord_stats["grp"] == "SELECCION"].set_index("ord_bucket")
-                s_res = ord_stats[ord_stats["grp"] == "RESTO"].set_index("ord_bucket")
-                worst_bucket = (s_sel["pnl_prom"] - s_res["pnl_prom"]).sort_values().index[0]
-                st.info(f"Señal rápida: el mayor deterioro relativo en la selección aparece en el trade #{worst_bucket} del día (en promedio).")
-            except Exception:
-                pass
+        mask = (daily["day"] >= pd.to_datetime(sel_from).date()) & (daily["day"] <= pd.to_datetime(sel_to).date()) & (daily["pnl"] >= sel_pnl_min) & (daily["pnl"] <= sel_pnl_max)
+        buckets_manual = daily.loc[mask, "day"].tolist()
+        st.write(f"Barras en la selección manual: **{len(buckets_manual)}**")
 
 
 # ============================================================
